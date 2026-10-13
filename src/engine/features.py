@@ -1,0 +1,325 @@
+"""Turn match history into simulator inputs (pools, adjustments, player shares).
+
+Everything here is computed "as of" a cutoff timestamp so the same code serves live
+projection (cutoff = now) and the walk-forward backtest (cutoff = series start).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+from src import config as C
+
+
+@dataclass
+class EngineConfig:
+    patch_decay: float = C.PATCH_DECAY
+    patch_lookback: int = C.PATCH_LOOKBACK
+    opp_full_games: int = C.OPP_ADJ_FULL_GAMES
+    opp_clamp: tuple = C.OPP_ADJ_CLAMP
+    shrink_games: int = C.SHRINK_GAMES
+    min_outcome_pool: int = C.MIN_OUTCOME_POOL
+    game_script: bool = False
+    game_script_clamp: tuple = C.GAME_SCRIPT_CLAMP
+    kappa: float = C.DEFAULT_KAPPA
+    position_priors: dict = field(default_factory=lambda: dict(C.POSITION_PRIORS))
+
+
+@dataclass
+class MatchupParams:
+    """Everything the simulator needs for one series. Index 0 = team A, 1 = team B."""
+    teams: tuple[str, str]
+    best_of: int
+    p_map: float
+    # pools[side][outcome] = (values, probs); outcome 1 = win, 0 = loss
+    pools: list
+    alpha: np.ndarray            # (2, 5) Dirichlet parameters
+    players: list                # [[5 names], [5 names]] in POSITIONS order
+    script_mult: float = 1.0
+    info: dict = field(default_factory=dict)
+
+
+class History:
+    """Columnar, time-sorted view of processed OE player/team rows."""
+
+    def __init__(self, players: pd.DataFrame, teams: pd.DataFrame):
+        t = teams.sort_values(["date", "gameid", "side"]).reset_index(drop=True)
+        opp = t.groupby("gameid")["teamname"].transform(lambda s: s.iloc[::-1].values)
+        self.t_time = t["date"].values.astype("datetime64[ns]").astype(np.int64)
+        self.t_team = t["teamname"].astype(str).values
+        self.t_opp = opp.astype(str).values
+        self.t_league = t["league"].astype(str).values
+        self.t_patch = t["patch_ord"].values.astype(np.int32)
+        self.t_result = t["result"].values.astype(np.int8)
+        self.t_kills = t["teamkills"].values.astype(float)
+        self.t_deaths = t["teamdeaths"].values.astype(float)
+        self.t_len = t["gamelength"].values.astype(float) / 60.0
+        self.team_idx = _index(self.t_team)
+        self.league_idx = _index(self.t_league)
+
+        p = players.sort_values(["date", "gameid"]).reset_index(drop=True)
+        self.p_time = p["date"].values.astype("datetime64[ns]").astype(np.int64)
+        self.p_player = p["playername"].astype(str).values
+        self.p_patch = p["patch_ord"].values.astype(np.int32)
+        self.p_kills = p["kills"].values.astype(float)
+        self.p_teamkills = p["teamkills"].values.astype(float)
+        self.player_idx = _index(self.p_player)
+        self.leagues = sorted(self.league_idx)
+
+    # ------------------------------------------------------------------ helpers ----
+    @staticmethod
+    def _prior(idx: np.ndarray, times: np.ndarray, cutoff: int) -> np.ndarray:
+        return idx[: np.searchsorted(times[idx], cutoff, side="left")]
+
+    def _weights(self, patches: np.ndarray, patch: int, cfg: EngineConfig):
+        back = np.clip(patch - patches, 0, None)
+        keep = back <= cfg.patch_lookback
+        return keep, cfg.patch_decay ** back
+
+    def team_rows(self, team, cutoff, patch, cfg):
+        idx = self.team_idx.get(team)
+        if idx is None:
+            return np.empty(0, dtype=int), np.empty(0)
+        idx = self._prior(idx, self.t_time, cutoff)
+        keep, w = self._weights(self.t_patch[idx], patch, cfg)
+        return idx[keep], w[keep]
+
+    def recent_rows(self, cutoff, patch, cfg, n=4000):
+        end = np.searchsorted(self.t_time, cutoff, side="left")
+        idx = np.arange(max(0, end - n), end)
+        keep, w = self._weights(self.t_patch[idx], patch, cfg)
+        return idx[keep], w[keep]
+
+    def home_league(self, team, cutoff) -> str | None:
+        idx = self.team_idx.get(team)
+        if idx is None:
+            return None
+        idx = self._prior(idx, self.t_time, cutoff)[-60:]
+        lg = [x for x in self.t_league[idx] if x in C.DOMESTIC_LEAGUES and x != "EM"]
+        if not lg:
+            lg = [x for x in self.t_league[idx] if x in C.DOMESTIC_LEAGUES]
+        if not lg:
+            return None
+        vals, counts = np.unique(lg, return_counts=True)
+        return str(vals[np.argmax(counts)])
+
+    # ------------------------------------------------------------------ environments --
+    def measured_env(self, league, cutoff, patch, cfg):
+        """(avg team kills per map, n games) for a league as of cutoff."""
+        idx = self.league_idx.get(league)
+        if idx is None:
+            return np.nan, 0
+        idx = self._prior(idx, self.t_time, cutoff)
+        if league in C.INTERNATIONAL_LEAGUES:
+            # events are sparse across patches: plain average of the most recent games
+            idx = idx[-240:]
+            if len(idx) == 0:
+                return np.nan, 0
+            return float(self.t_kills[idx].mean()), len(idx) // 2
+        keep, w = self._weights(self.t_patch[idx], patch, cfg)
+        idx, w = idx[keep], w[keep]
+        if len(idx) == 0:
+            return np.nan, 0
+        return float(np.average(self.t_kills[idx], weights=w)), len(idx) // 2
+
+    def env_table(self, cutoff, patch, cfg) -> dict:
+        """Kill environment for every league (used to normalize pool entries)."""
+        rows, w = self.recent_rows(cutoff, patch, cfg)
+        glob = float(np.average(self.t_kills[rows], weights=w)) if len(rows) else 14.0
+        out = {"_global": glob}
+        for lg in self.leagues:
+            m, n = self.measured_env(lg, cutoff, patch, cfg)
+            if lg in C.INTERNATIONAL_LEAGUES:
+                wt = min(1.0, n / C.EVENT_ENV_FULL_WEIGHT_GAMES)
+                prior = glob * C.EVENT_ENV_PRIOR.get(lg, 1.0)
+                out[lg] = prior if n == 0 else wt * m + (1 - wt) * prior
+            else:
+                out[lg] = m if n >= 10 else glob
+        return out
+
+    def target_env(self, league, team_a, team_b, cutoff, patch, cfg, envs) -> float:
+        if league not in C.INTERNATIONAL_LEAGUES:
+            return envs.get(league, envs["_global"])
+        homes = [self.home_league(t, cutoff) for t in (team_a, team_b)]
+        home_env = np.mean([envs.get(h, envs["_global"]) if h else envs["_global"]
+                            for h in homes])
+        prior = home_env * C.EVENT_ENV_PRIOR.get(league, 1.0)
+        m, n = self.measured_env(league, cutoff, patch, cfg)
+        if n == 0:
+            return float(prior)
+        wt = min(1.0, n / C.EVENT_ENV_FULL_WEIGHT_GAMES)
+        return float(wt * m + (1 - wt) * prior)
+
+    # ------------------------------------------------------------------ players ------
+    def player_share(self, player, cutoff, patch, cfg):
+        """(patch-weighted kill share over all games, n games)."""
+        idx = self.player_idx.get(player)
+        if idx is None:
+            return np.nan, 0
+        idx = self._prior(idx, self.p_time, cutoff)
+        keep, w = self._weights(self.p_patch[idx], patch, cfg)
+        idx, w = idx[keep], w[keep]
+        denom = np.sum(w * self.p_teamkills[idx])
+        if len(idx) == 0 or denom <= 0:
+            return np.nan, len(idx)
+        return float(np.sum(w * self.p_kills[idx]) / denom), len(idx)
+
+    def player_mean_kills(self, player, cutoff, patch, cfg):
+        idx = self.player_idx.get(player)
+        if idx is None:
+            return np.nan, 0
+        idx = self._prior(idx, self.p_time, cutoff)
+        keep, w = self._weights(self.p_patch[idx], patch, cfg)
+        idx, w = idx[keep], w[keep]
+        if len(idx) == 0:
+            return np.nan, 0
+        return float(np.average(self.p_kills[idx], weights=w)), len(idx)
+
+
+def _index(values: np.ndarray) -> dict:
+    order = np.argsort(values, kind="stable")
+    sv = values[order]
+    uniq, starts = np.unique(sv, return_index=True)
+    ends = list(starts[1:]) + [len(sv)]
+    return {u: np.sort(order[s:e]) for u, s, e in zip(uniq, starts, ends)}
+
+
+def fit_kappa(hist: History, cutoff: int, n_rows: int = 30000) -> float:
+    """Method-of-moments Dirichlet concentration from player kill shares before cutoff."""
+    end = np.searchsorted(hist.p_time, cutoff, side="left")
+    sl = slice(max(0, end - n_rows), end)
+    k, K, pl = hist.p_kills[sl], hist.p_teamkills[sl], hist.p_player[sl]
+    if len(k) < 500:
+        return C.DEFAULT_KAPPA
+    df = pd.DataFrame({"k": k, "K": K, "pl": pl})
+    sums = df.groupby("pl")[["k", "K"]].transform("sum")
+    p = (sums["k"] / sums["K"].where(sums["K"] > 0)).fillna(0.2).values
+    resid = np.sum((k - K * p) ** 2)
+    base = K * p * (1 - p)
+    if resid <= base.sum():
+        return 1e4
+
+    def f(kappa):
+        return np.sum(base * (K + kappa) / (1 + kappa)) - resid
+
+    lo, hi = 0.1, 1e4
+    if f(lo) < 0:
+        return lo
+    for _ in range(100):
+        mid = np.sqrt(lo * hi)
+        if f(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return float(np.sqrt(lo * hi))
+
+
+def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of: int,
+                  p_map: float, lineups: tuple[list, list], cutoff, patch: int,
+                  cfg: EngineConfig | None = None) -> MatchupParams:
+    """Assemble MatchupParams.
+
+    lineups: ([5 player names A], [5 player names B]) in POSITIONS order.
+    cutoff: pandas Timestamp / ns int; only history strictly before it is used.
+    """
+    cfg = cfg or EngineConfig()
+    cutoff = int(pd.Timestamp(cutoff).value) if not isinstance(cutoff, (int, np.integer)) \
+        else int(cutoff)
+    envs = hist.env_table(cutoff, patch, cfg)
+    target = hist.target_env(league, team_a, team_b, cutoff, patch, cfg, envs)
+    env_of = np.vectorize(lambda lg: envs.get(lg, envs["_global"]), otypes=[float])
+
+    teams = (team_a, team_b)
+    rows = [hist.team_rows(t, cutoff, patch, cfg) for t in teams]
+    g_idx, g_w = hist.recent_rows(cutoff, patch, cfg)
+    g_norm = hist.t_kills[g_idx] / env_of(hist.t_league[g_idx]) if len(g_idx) else g_idx
+
+    info = {"target_env": target, "envs": envs}
+    pools = []
+    for s in (0, 1):
+        o = 1 - s
+        # (c) opponent adjustment: opponent kills-allowed relative to its leagues' averages
+        o_idx, o_w = rows[o]
+        if len(o_idx):
+            allowed = hist.t_deaths[o_idx] / env_of(hist.t_league[o_idx])
+            raw = float(np.average(allowed, weights=o_w))
+        else:
+            raw = 1.0
+        fade = min(1.0, len(o_idx) / cfg.opp_full_games)
+        adj = float(np.clip(1.0 + (raw - 1.0) * fade, *cfg.opp_clamp))
+        info[f"opp_adj_{s}"] = adj
+
+        # (b)+(d) W/L pools, normalized by origin-league env, rescaled to target env
+        idx, w = rows[s]
+        norm = hist.t_kills[idx] / env_of(hist.t_league[idx]) if len(idx) else np.empty(0)
+        side_pools = [None, None]
+        for outcome in (0, 1):
+            sel = hist.t_result[idx] == outcome
+            vals, wts = norm[sel], w[sel]
+            n = int(sel.sum())
+            if n < cfg.min_outcome_pool:
+                gsel = hist.t_result[g_idx] == outcome
+                gv, gw = g_norm[gsel], g_w[gsel]
+                if len(gv):
+                    share_team = n / cfg.min_outcome_pool
+                    wts = wts / wts.sum() * share_team if n else wts
+                    gw = gw / gw.sum() * (1 - share_team)
+                    vals, wts = np.concatenate([vals, gv]), np.concatenate([wts, gw])
+            if len(vals) == 0:  # no history at all: neutral environment
+                vals, wts = np.array([1.3 if outcome else 0.7]), np.array([1.0])
+            probs = wts / wts.sum()
+            side_pools[outcome] = (vals * target * adj, probs)
+            info[f"n_pool_{s}_{outcome}"] = n
+        pools.append(side_pools)
+
+    # (e) game-script multiplier
+    script = 1.0
+    if cfg.game_script:
+        script = _game_script(hist, rows, league, envs, env_of, cutoff, patch, cfg)
+    info["script_mult_raw"] = script
+
+    # (f) player shares from overall pools, shrunk toward position priors
+    alpha = np.zeros((2, 5))
+    for s in (0, 1):
+        shares = np.zeros(5)
+        for j, (pos, pl) in enumerate(zip(C.POSITIONS, lineups[s])):
+            prior = cfg.position_priors[pos]
+            obs, n = hist.player_share(pl, cutoff, patch, cfg)
+            wt = min(1.0, n / cfg.shrink_games) if cfg.shrink_games > 0 else 1.0
+            shares[j] = prior if np.isnan(obs) else wt * obs + (1 - wt) * prior
+            info[f"share_{s}_{j}"] = (shares[j], n)
+        shares = np.clip(shares, 1e-3, None)
+        alpha[s] = cfg.kappa * shares / shares.sum()
+
+    return MatchupParams(teams=teams, best_of=best_of, p_map=float(p_map), pools=pools,
+                         alpha=alpha, players=[list(lineups[0]), list(lineups[1])],
+                         script_mult=script, info=info)
+
+
+def _game_script(hist, rows, league, envs, env_of, cutoff, patch, cfg) -> float:
+    """Projected combined KPM x projected length vs the league baseline."""
+    rates, lens = [], []
+    for idx, w in rows:
+        if len(idx) == 0:
+            continue
+        comb = (hist.t_kills[idx] + hist.t_deaths[idx]) / (2 * env_of(hist.t_league[idx]))
+        rates.append(np.average(comb / hist.t_len[idx], weights=w))
+        lens.append(np.average(hist.t_len[idx], weights=w))
+    if len(rates) < 2:
+        return 1.0
+    lg_idx = hist.league_idx.get(league)
+    if lg_idx is None or league in C.INTERNATIONAL_LEAGUES:
+        b_idx, b_w = hist.recent_rows(cutoff, patch, cfg)
+    else:
+        b_idx = hist._prior(lg_idx, hist.t_time, cutoff)
+        keep, b_w = hist._weights(hist.t_patch[b_idx], patch, cfg)
+        b_idx, b_w = b_idx[keep], b_w[keep]
+    if len(b_idx) < 20:
+        return 1.0
+    b_comb = (hist.t_kills[b_idx] + hist.t_deaths[b_idx]) / (2 * env_of(hist.t_league[b_idx]))
+    base_rate = np.average(b_comb / hist.t_len[b_idx], weights=b_w)
+    base_len = np.average(hist.t_len[b_idx], weights=b_w)
+    mult = (np.mean(rates) * np.mean(lens)) / (base_rate * base_len)
+    return float(np.clip(mult, *cfg.game_script_clamp))

@@ -1,0 +1,9 @@
+[project]
+name = "lol-kills-model"
+version = "0.1.0"
+description = "League of Legends player-kills prop model (Monte Carlo + walk-forward backtest)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
