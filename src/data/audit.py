@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.config import POSITIONS
+from src.config import LEAGUE_CODE_ALIASES, POSITIONS
 
 EXPECTED_LEAGUES = ["LCK", "LPL", "LEC", "LCS", "LCKC", "EM", "LFL", "FST", "WLDs", "MSI"]
 
@@ -20,17 +20,23 @@ def audit(raw: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
     """Return (markdown report, list of missing expected league codes)."""
     raw_games = raw.drop_duplicates("gameid")[["gameid", "league", "datacompleteness"]]
     found = sorted(raw["league"].dropna().astype(str).unique())
-    missing = [lg for lg in EXPECTED_LEAGUES if lg not in found]
+    found_canonical = set(found) | {LEAGUE_CODE_ALIASES.get(lg, lg) for lg in found}
+    missing = [lg for lg in EXPECTED_LEAGUES if lg not in found_canonical]
 
     per_league = raw_games.groupby("league").agg(
         raw_games=("gameid", "size"),
         incomplete_games=("datacompleteness", lambda s: int((s != "complete").sum())),
     )
     per_league["raw_rows"] = raw.groupby("league").size()
-    kept = teams.groupby("league", observed=True).agg(
+    # Count kept games under the raw OE code so aliased codes get their own row.
+    raw_code = raw_games.set_index("gameid")["league"]
+    kept = teams.assign(league=teams["gameid"].map(raw_code)).groupby("league").agg(
         kept_games=("gameid", "nunique"), kept_series=("series_id", "nunique"))
     per_league = per_league.join(kept, how="left").fillna(0).astype(int)
-    per_league["in_scope"] = [lg in EXPECTED_LEAGUES for lg in per_league.index]
+    # Aliased codes (e.g. 2025 "LTA N" -> "LCS") are counted under their canonical code.
+    per_league["maps_to"] = [LEAGUE_CODE_ALIASES.get(lg, "") for lg in per_league.index]
+    per_league["in_scope"] = [lg in EXPECTED_LEAGUES or LEAGUE_CODE_ALIASES.get(lg)
+                              in EXPECTED_LEAGUES for lg in per_league.index]
     per_league = per_league.reset_index().sort_values(
         ["in_scope", "raw_games"], ascending=[False, False])
 
@@ -38,7 +44,8 @@ def audit(raw: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
     patches = raw["patch"].dropna().astype(str)
     from src.data.oe import patch_key
     pk = sorted(patches.unique(), key=patch_key)
-    in_scope = raw_games[raw_games["league"].isin(EXPECTED_LEAGUES)]
+    in_scope = raw_games[raw_games["league"].replace(LEAGUE_CODE_ALIASES)
+                         .isin(EXPECTED_LEAGUES)]
     series = teams.drop_duplicates("series_id")
     lines = [
         "# Data audit", "",
@@ -57,8 +64,17 @@ def audit(raw: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
         "## Expected league codes", "",
         "MISSING: " + ", ".join(missing) if missing else "All expected league codes found.",
         "", "## League codes found in the file", "", ", ".join(found), "",
+        "## League code aliases", "",
+        (", ".join(f"{k} -> {v}" for k, v in LEAGUE_CODE_ALIASES.items())
+         if LEAGUE_CODE_ALIASES else "none"), "",
         "## Per league", "", _md(per_league), "",
     ]
+    inc = per_league[per_league["in_scope"]]
+    inc = inc[inc["incomplete_games"] > 0.25 * inc["raw_games"]]
+    if len(inc):
+        lines += ["## Warnings", ""] + [
+            f"- {r.league}: {r.incomplete_games}/{r.raw_games} games not 'complete' "
+            f"(dropped)" for r in inc.itertuples()] + [""]
     pos = players["position"].astype(str).value_counts()
     odd = sorted(set(pos.index) - set(POSITIONS))
     if odd:

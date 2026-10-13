@@ -19,12 +19,15 @@ ALIASES: dict[str, str] = {
     "t1": "T1", "skt": "T1", "sktt1": "T1",
     "gen": "Gen.G", "geng": "Gen.G", "gengesports": "Gen.G",
     "hle": "Hanwha Life Esports", "hanwha": "Hanwha Life Esports",
-    "dk": "Dplus KIA", "dpluskia": "Dplus KIA", "damwon": "Dplus KIA",
+    "dk": "Dplus Kia", "dpluskia": "Dplus Kia", "damwon": "Dplus Kia",
     "kt": "KT Rolster", "ktrolster": "KT Rolster",
     "ns": "Nongshim RedForce", "nongshim": "Nongshim RedForce",
-    "drx": "DRX", "bro": "OKSavingsBank BRION", "brion": "OKSavingsBank BRION",
+    "drx": "Kiwoom DRX", "kiwoomdrx": "Kiwoom DRX",
+    "bro": "HANJIN BRION", "brion": "HANJIN BRION", "hanjinbrion": "HANJIN BRION",
+    "oksavingsbankbrion": "HANJIN BRION",
     "fox": "BNK FEARX", "fearx": "BNK FEARX", "bfx": "BNK FEARX",
-    "kdf": "DN Freecs", "dnf": "DN Freecs", "kwangdong": "DN Freecs",
+    "dns": "DN SOOPers", "soopers": "DN SOOPers", "dnsoopers": "DN SOOPers",
+    "kdf": "DN SOOPers", "dnf": "DN SOOPers", "dnfreecs": "DN SOOPers", "kwangdong": "DN SOOPers",
     # LPL
     "blg": "Bilibili Gaming", "bilibili": "Bilibili Gaming",
     "jdg": "JD Gaming", "tes": "Top Esports", "topesports": "Top Esports",
@@ -39,13 +42,14 @@ ALIASES: dict[str, str] = {
     "kc": "Karmine Corp", "karmine": "Karmine Corp",
     "mkoi": "Movistar KOI", "koi": "Movistar KOI", "vit": "Team Vitality",
     "vitality": "Team Vitality", "th": "Team Heretics", "heretics": "Team Heretics",
-    "bds": "Team BDS", "gx": "GIANTX", "giantx": "GIANTX", "sk": "SK Gaming",
+    "bds": "Team BDS", "gx": "GiantX", "sk": "SK Gaming", "lr": "Los Ratones",
+    "ratones": "Los Ratones",
     "rge": "Rogue", "navi": "Natus Vincere",
     # LCS / LTA North
     "tl": "Team Liquid", "liquid": "Team Liquid", "c9": "Cloud9", "cloud9": "Cloud9",
     "fly": "FlyQuest", "flyquest": "FlyQuest", "100": "100 Thieves", "100t": "100 Thieves",
     "dig": "Dignitas", "sr": "Shopify Rebellion", "imt": "Immortals", "nrg": "NRG",
-    "lyon": "LYON", "dsg": "Disguised",
+    "lyon": "LYON", "dsg": "Disguised", "sen": "Sentinels", "sentinels": "Sentinels",
 }
 
 

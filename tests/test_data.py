@@ -49,6 +49,10 @@ def test_team_resolve():
     assert resolve("G2", known) == "G2 Esports"
     assert resolve("Team Liqiud", known) == "Team Liquid"  # typo -> fuzzy
     assert resolve("Totally Unknown Squad", known) is None
+    # OE 2026 names
+    assert resolve("DK", ["Dplus Kia", "T1"]) == "Dplus Kia"
+    assert resolve("BRO", ["HANJIN BRION", "T1"]) == "HANJIN BRION"
+    assert resolve("DNF", ["DN SOOPers", "T1"]) == "DN SOOPers"
 
 
 def test_metrics():
@@ -87,3 +91,13 @@ def test_league_code_aliases(raw, monkeypatch):
     monkeypatch.setattr(oe, "LEAGUE_CODE_ALIASES", {"LDL": "LPL"})
     players, teams = oe.process(raw)
     assert "LPL" in set(teams["league"].astype(str))
+
+
+def test_lta_north_maps_to_lcs(raw):
+    import src.data.oe as oe
+    from src.config import LEAGUE_CODE_ALIASES
+    assert LEAGUE_CODE_ALIASES["LTA N"] == "LCS"
+    lcs = raw["league"] == "LEC"  # fixture has no LCS: relabel one league as LTA N
+    players, teams = oe.process(raw.assign(league=raw["league"].mask(lcs, "LTA N")))
+    assert "LCS" in set(teams["league"].astype(str))
+    assert "LTA N" not in set(teams["league"].astype(str))

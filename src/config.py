@@ -15,7 +15,11 @@ LEAGUES = DOMESTIC_LEAGUES + INTERNATIONAL_LEAGUES
 
 # OE league code -> canonical code used by the model. Applied in src.data.oe.filter_raw
 # before the league filter. Fill from reports/data_audit.md ("League codes found").
-LEAGUE_CODE_ALIASES: dict[str, str] = {}
+# 2025: the LCS was replaced by the LTA with a North conference ("LTA N"); OE files those
+# games as "LTA N" and the 2026 LCS as "LCS". Same teams and environment -> one code.
+# Not aliased (out of scope): "LTA S" (CBLOL/LLA successor) and "LTA" (cross-conference
+# N vs S games), "EWC" (Esports World Cup), "KeSPA Cup".
+LEAGUE_CODE_ALIASES: dict[str, str] = {"LTA N": "LCS", "LTA North": "LCS"}
 
 # Prior multiplier applied to the participants' home-league average when an international
 # event has little measured history. FST is structurally low-kill.
