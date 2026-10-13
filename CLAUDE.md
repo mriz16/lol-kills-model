@@ -107,10 +107,11 @@ tests/                      pytest (fixture in tests/fixtures/)
   "not selected"). `--quick` scores only the latest 6 months; `--variants` picks a subset.
 
 ## Status
-- Phase 1 built; gate report in `reports/backtest_synthetic.md` (synthetic data only:
-  Google Drive / oracleselixir.com were blocked in the build sandbox). Re-run on real OE
-  data with `python scripts/refresh_data.py && python scripts/run_backtest.py`.
-- Game-script toggle: OFF (hurt CRPS on the synthetic backtest).
-- Phase 1 open issue: right tails too thin (mostly sup/top). Phase 1.5 adds toggles A/B/C
-  to test fixes; pick based on the REAL-data backtest, not synthetic.
-- Next: user merges, runs refresh workflow, then real-data backtest. UI not started.
+- Phase 1 built; synthetic gate report in `reports/backtest_synthetic.md`.
+- Real-data backtest done: `reports/backtest_real.md` (OE 2025-2026, 22,073 player-series).
+  Recommended lock (awaiting user sign-off): shrink30 + A (position_kappa) + B50
+  (neff_floor=50); game-script OFF; C OFF. CRPS -0.0199 vs base (se 0.0018).
+- League codes: OE 2025 `LTA N` aliased to LCS (`LEAGUE_CODE_ALIASES`). LPL 2025 is
+  entirely non-`complete` in OE, so LPL history starts 2026.
+- Open: mean under-prediction ~0.13 kills/player-series (top/mid/bot), tails still ~10%
+  thin; higher B floors untested. UI not started.
