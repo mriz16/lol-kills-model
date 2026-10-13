@@ -85,11 +85,32 @@ src/backtest/               elo, metrics, walk-forward runner
 tests/                      pytest (fixture in tests/fixtures/)
 ```
 
+## Phase 1.5 additions
+- `refresh.yml`: manual dispatch (optional `years` input), `OE_DRIVE_FOLDER_ID` from repo
+  variable `vars.OE_DRIVE_FOLDER_ID`, Python 3.11. Fails the job on HTML downloads, 0 rows,
+  missing OE columns, no in-scope games, or parquet > 50 MB. Writes `reports/data_audit.md`
+  (also printed to the log and the job summary) and commits it with the parquet.
+- Committed parquet is slim: only the columns in `PLAYER_KEEP` / `TEAM_KEEP` (`src/data/oe.py`).
+- `ci.yml`: pytest on Python 3.11 on every push / PR.
+- Upper-tail toggles on `EngineConfig`, **all off by default, none locked**:
+  - A `position_kappa`: concentration fitted per position (method of moments); shares
+    drawn as independent Gamma(k_j*s_j, 1/k_j), normalized, so means stay at s_j.
+  - B `neff_floor` (15 / 25 tested): if Kish n_eff of a team's decay-weighted W or L pool
+    is below the floor, mix with the league W/L pool (international -> global pool) at the
+    largest team weight that reaches the floor.
+  - C `smooth_bootstrap`: each drawn team-kill value x becomes NB(mean x, r_league), r
+    fitted per league by method of moments on within-(team, result) variance.
+- Backtest primary market = what is bet: Map 1 (BO1), Maps 1-2 (BO3), Maps 1-3 (BO5).
+  Tail report: P(over) vs hit rate at lines rounded median + 1.5/2.5/3.5, by position.
+  Variants: base(shrink20), shrink30, shrink30+A, +B15, +B25, +C, and shrink30+A+X where X
+  is the best stand-alone B/C by CRPS (all three A+X combos run; the others are marked
+  "not selected"). `--quick` scores only the latest 6 months; `--variants` picks a subset.
+
 ## Status
 - Phase 1 built; gate report in `reports/backtest_synthetic.md` (synthetic data only:
   Google Drive / oracleselixir.com were blocked in the build sandbox). Re-run on real OE
   data with `python scripts/refresh_data.py && python scripts/run_backtest.py`.
 - Game-script toggle: OFF (hurt CRPS on the synthetic backtest).
-- Open issue: predicted right tails are too thin (lines above the median hit more often
-  than predicted), mostly sup/top. Suspected cause: small effective bootstrap pool under
-  0.65 patch decay. Fix needs user sign-off (locked decision).
+- Phase 1 open issue: right tails too thin (mostly sup/top). Phase 1.5 adds toggles A/B/C
+  to test fixes; pick based on the REAL-data backtest, not synthetic.
+- Next: user merges, runs refresh workflow, then real-data backtest. UI not started.
