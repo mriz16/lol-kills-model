@@ -6,7 +6,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from src.config import LEAGUES, POSITIONS
+from src.config import LEAGUE_CODE_ALIASES, LEAGUES, POSITIONS
 
 REQUIRED_COLUMNS = [
     "gameid", "datacompleteness", "league", "year", "split", "playoffs", "date", "game",
@@ -59,6 +59,8 @@ def filter_raw(raw: pd.DataFrame, leagues=LEAGUES) -> pd.DataFrame:
     missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
     if missing:
         raise ValueError(f"OE data missing columns: {missing}")
+    raw = raw.assign(league=raw["league"].replace(LEAGUE_CODE_ALIASES)) \
+        if LEAGUE_CODE_ALIASES else raw
     df = raw[(raw["datacompleteness"] == "complete") & raw["league"].isin(leagues)].copy()
     df["date"] = pd.to_datetime(df["date"])
     # Drop games that are not exactly 2 team rows + 10 player rows.

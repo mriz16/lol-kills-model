@@ -126,13 +126,13 @@ def test_primary_market_is_what_is_bet():
 
 
 def test_variant_list():
-    assert set(VARIANTS) >= {"base", "shrink30", "shrink30+A", "shrink30+B15",
-                             "shrink30+B25", "shrink30+C"}
+    assert set(VARIANTS) >= {"base", "shrink30", "shrink30+A", "shrink30+B25",
+                             "shrink30+B35", "shrink30+B50", "shrink30+C"}
     assert VARIANTS["base"].shrink_games == 20
     assert all(v.shrink_games == 30 for k, v in VARIANTS.items() if k != "base")
-    t = pd.DataFrame({"variant": ["shrink30+B15", "shrink30+B25", "shrink30+C"],
-                      "crps": [1.7, 1.6, 1.8]})
-    assert pick_best_combo(t) == "shrink30+A+B25"
+    t = pd.DataFrame({"variant": ["shrink30+B25", "shrink30+B35", "shrink30+C"],
+                      "crps": [1.7, 1.6, 1.5]})
+    assert pick_best_combo(t) == "shrink30+A+B35"  # C is not a B candidate
 
 
 def test_backtest_tail_report_and_quick(processed):

@@ -13,6 +13,10 @@ DOMESTIC_LEAGUES = ["LCK", "LPL", "LEC", "LCS", "LCKC", "EM", "LFL"]
 INTERNATIONAL_LEAGUES = ["WLDs", "Worlds", "MSI", "FST"]
 LEAGUES = DOMESTIC_LEAGUES + INTERNATIONAL_LEAGUES
 
+# OE league code -> canonical code used by the model. Applied in src.data.oe.filter_raw
+# before the league filter. Fill from reports/data_audit.md ("League codes found").
+LEAGUE_CODE_ALIASES: dict[str, str] = {}
+
 # Prior multiplier applied to the participants' home-league average when an international
 # event has little measured history. FST is structurally low-kill.
 EVENT_ENV_PRIOR = {"WLDs": 1.00, "Worlds": 1.00, "MSI": 1.00, "FST": 0.88}

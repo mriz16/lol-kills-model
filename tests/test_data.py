@@ -75,6 +75,15 @@ def test_refresh_script_on_local_csv(tmp_path):
     root = Path(__file__).resolve().parents[1]
     r = subprocess.run([sys.executable, str(root / "scripts" / "refresh_data.py"), "--csv",
                         str(root / "tests" / "fixtures" / "oe_fixture.csv"), "--out",
-                        str(tmp_path)], capture_output=True, text=True)
+                        str(tmp_path), "--audit", str(tmp_path / "audit.md")],
+                       capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+    assert (tmp_path / "audit.md").exists()
     assert len(pd.read_parquet(tmp_path / "players.parquet")) > 0
+
+
+def test_league_code_aliases(raw, monkeypatch):
+    import src.data.oe as oe
+    monkeypatch.setattr(oe, "LEAGUE_CODE_ALIASES", {"LDL": "LPL"})
+    players, teams = oe.process(raw)
+    assert "LPL" in set(teams["league"].astype(str))

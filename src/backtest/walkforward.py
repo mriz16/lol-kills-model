@@ -16,20 +16,25 @@ from src.engine.features import (EngineConfig, History, build_matchup, fit_kappa
 from src.engine.sim import simulate_series
 
 S30 = dict(shrink_games=30)
-VARIANTS = {
+# Every named configuration the runner knows. --variants picks any subset.
+ALL_VARIANTS = {
     "base": EngineConfig(),                                   # shrink20
     "shrink30": EngineConfig(**S30),
     "shrink30+A": EngineConfig(**S30, position_kappa=True),
-    "shrink30+B15": EngineConfig(**S30, neff_floor=15),
-    "shrink30+B25": EngineConfig(**S30, neff_floor=25),
     "shrink30+C": EngineConfig(**S30, smooth_bootstrap=True),
-    # A combined with each of B15/B25/C; summarize() keeps the one matching the best
-    # stand-alone B/C variant as "shrink30+A+best".
-    "shrink30+A+B15": EngineConfig(**S30, position_kappa=True, neff_floor=15),
-    "shrink30+A+B25": EngineConfig(**S30, position_kappa=True, neff_floor=25),
     "shrink30+A+C": EngineConfig(**S30, position_kappa=True, smooth_bootstrap=True),
 }
-BC_CANDIDATES = ["shrink30+B15", "shrink30+B25", "shrink30+C"]
+for _f in (15, 25, 35, 50):
+    ALL_VARIANTS[f"shrink30+B{_f}"] = EngineConfig(**S30, neff_floor=_f)
+    ALL_VARIANTS[f"shrink30+A+B{_f}"] = EngineConfig(**S30, position_kappa=True,
+                                                     neff_floor=_f)
+
+# Default run (real-data backtest). A is run with every B floor; summarize() keeps the
+# one matching the best stand-alone B as "shrink30+A+best-B".
+DEFAULT_VARIANTS = ["base", "shrink30", "shrink30+B25", "shrink30+B35", "shrink30+B50",
+                    "shrink30+A", "shrink30+A+B25", "shrink30+A+B35", "shrink30+A+B50",
+                    "shrink30+C"]
+VARIANTS = {k: ALL_VARIANTS[k] for k in DEFAULT_VARIANTS}
 TAIL_OFFSETS = (1.5, 2.5, 3.5)
 
 
@@ -197,8 +202,8 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
 
 
 def pick_best_combo(table: pd.DataFrame) -> str | None:
-    """Name of the A+{B15,B25,C} variant matching the best stand-alone B/C (by CRPS)."""
-    cand = table[table["variant"].isin(BC_CANDIDATES)]
+    """The shrink30+A+B<n> variant whose floor matches the best stand-alone B (by CRPS)."""
+    cand = table[table["variant"].str.fullmatch(r"shrink30\+B\d+")]
     if cand.empty:
         return None
     best = cand.sort_values("crps")["variant"].iloc[0]
@@ -236,7 +241,7 @@ def summarize(res: pd.DataFrame) -> dict:
     combo = pick_best_combo(table)
     table["note"] = ""
     if combo is not None and combo in set(table["variant"]):
-        table.loc[table["variant"] == combo, "note"] = "shrink30+A+best"
+        table.loc[table["variant"] == combo, "note"] = "shrink30+A+best-B"
         others = [v for v in table["variant"] if v.startswith("shrink30+A+") and v != combo]
         table.loc[table["variant"].isin(others), "note"] = "not selected"
 
