@@ -20,8 +20,16 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.config import DATA_DIR, LEAGUES  # noqa: E402
-from src.data.oe import process  # noqa: E402
+from src.config import DATA_DIR, LEAGUES, REPORTS_DIR  # noqa: E402
+from src.data.audit import audit  # noqa: E402
+from src.data.oe import REQUIRED_COLUMNS, process  # noqa: E402
+
+MAX_PARQUET_MB = 50
+
+
+class DataError(RuntimeError):
+    """Download/parse produced unusable data: fail the job loudly."""
+
 
 DEFAULT_FOLDER_ID = "1gLSw0RLjBbtaNy0dgnGQDAZOHIgCe-HH"
 FILE_TEMPLATE = "{year}_LoL_esports_match_data_from_OraclesElixir.csv"
@@ -35,8 +43,8 @@ def download_year(year: int, out_dir: Path) -> Path:
     if file_id:
         gdown.download(id=file_id, output=str(target), quiet=False)
         return target
-    folder = os.environ.get("OE_DRIVE_FOLDER_ID", DEFAULT_FOLDER_ID)
-    files = gdown.download_folder(id=folder, skip_download=True, quiet=True)
+    folder = os.environ.get("OE_DRIVE_FOLDER_ID") or DEFAULT_FOLDER_ID
+    files = gdown.download_folder(id=folder, skip_download=True, quiet=True) or []
     match = [f for f in files if Path(f.path).name == target.name]
     if not match:
         raise FileNotFoundError(f"{target.name} not found in Drive folder {folder}")
@@ -44,14 +52,35 @@ def download_year(year: int, out_dir: Path) -> Path:
     return target
 
 
+def check_not_html(path: Path) -> None:
+    """Drive quota/permission errors come back as an HTML page saved under the CSV name."""
+    if not path.exists() or path.stat().st_size == 0:
+        raise DataError(f"{path.name}: download is missing or empty")
+    head = path.read_bytes()[:2048].lstrip().lower()
+    if head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<html" in head:
+        raise DataError(f"{path.name}: download returned HTML, not CSV "
+                        f"(Drive quota / permissions / wrong file id?)")
+
+
 def read_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, low_memory=False)
+    check_not_html(path)
+    df = pd.read_csv(path, low_memory=False)
+    if len(df) == 0:
+        raise DataError(f"{path.name}: 0 rows")
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise DataError(f"{path.name}: not an OE match file, missing columns {missing}")
+    return df
 
 
-def write(players: pd.DataFrame, teams: pd.DataFrame, out_dir: Path) -> None:
+def write(players: pd.DataFrame, teams: pd.DataFrame, out_dir: Path) -> float:
     out_dir.mkdir(parents=True, exist_ok=True)
     players.to_parquet(out_dir / "players.parquet", index=False, compression="zstd")
     teams.to_parquet(out_dir / "teams.parquet", index=False, compression="zstd")
+    mb = sum((out_dir / f).stat().st_size for f in ("players.parquet", "teams.parquet")) / 2**20
+    if mb > MAX_PARQUET_MB:
+        raise DataError(f"parquet is {mb:.1f} MB (> {MAX_PARQUET_MB} MB limit)")
+    return mb
 
 
 def main(argv=None) -> int:
@@ -59,8 +88,17 @@ def main(argv=None) -> int:
     ap.add_argument("--years", type=int, nargs="*")
     ap.add_argument("--csv", type=Path, nargs="*", help="use local CSV(s) instead of Drive")
     ap.add_argument("--out", type=Path, default=DATA_DIR)
+    ap.add_argument("--audit", type=Path, default=REPORTS_DIR / "data_audit.md")
     args = ap.parse_args(argv)
+    try:
+        return run(args)
+    except DataError as exc:
+        print(f"::error::{exc}")
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
+
+def run(args) -> int:
     if args.csv:
         paths = list(args.csv)
     else:
@@ -71,19 +109,23 @@ def main(argv=None) -> int:
         for y in years:
             try:
                 paths.append(download_year(y, tmp))
-            except Exception as exc:  # a missing future/old year should not kill refresh
-                print(f"warning: could not download {y}: {exc}", file=sys.stderr)
+            except FileNotFoundError as exc:  # e.g. next year's file not published yet
+                print(f"::warning::{exc}")
         if not paths:
-            print("error: nothing downloaded", file=sys.stderr)
-            return 1
+            raise DataError("nothing downloaded")
 
     raw = pd.concat([read_csv(p) for p in paths], ignore_index=True)
     players, teams = process(raw, LEAGUES)
-    write(players, teams, args.out)
-    print(f"wrote {len(players)} player rows, {len(teams)} team rows, "
-          f"{teams['gameid'].nunique()} games, {teams['series_id'].nunique()} series "
-          f"-> {args.out}")
-    print(teams.groupby("league", observed=True)["gameid"].nunique().to_string())
+    if len(teams) == 0:
+        raise DataError("0 complete in-scope games after filtering (league codes changed?)")
+    text, missing = audit(raw, players, teams, [p.name for p in paths])
+    print(text)
+    args.audit.parent.mkdir(parents=True, exist_ok=True)
+    args.audit.write_text(text)
+    for lg in missing:
+        print(f"::warning::expected league code {lg} not found in OE data")
+    mb = write(players, teams, args.out)
+    print(f"wrote {len(players)} player rows, {len(teams)} team rows ({mb:.2f} MB) -> {args.out}")
     return 0
 
 

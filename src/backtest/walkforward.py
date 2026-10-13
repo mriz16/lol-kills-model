@@ -11,15 +11,26 @@ from src.backtest.elo import Elo
 from src.backtest.metrics import (calibration_table, crps_discrete, ece, log_score,
                                   poisson_scores)
 from src.config import POSITION_PRIORS, POSITIONS
-from src.engine.features import EngineConfig, History, build_matchup, fit_kappa
+from src.engine.features import (EngineConfig, History, build_matchup, fit_kappa,
+                                 fit_kappa_by_position, fit_nb_dispersion)
 from src.engine.sim import simulate_series
 
+S30 = dict(shrink_games=30)
 VARIANTS = {
-    "base": EngineConfig(),
-    "game_script": EngineConfig(game_script=True),
-    "shrink10": EngineConfig(shrink_games=10),
-    "shrink30": EngineConfig(shrink_games=30),
+    "base": EngineConfig(),                                   # shrink20
+    "shrink30": EngineConfig(**S30),
+    "shrink30+A": EngineConfig(**S30, position_kappa=True),
+    "shrink30+B15": EngineConfig(**S30, neff_floor=15),
+    "shrink30+B25": EngineConfig(**S30, neff_floor=25),
+    "shrink30+C": EngineConfig(**S30, smooth_bootstrap=True),
+    # A combined with each of B15/B25/C; summarize() keeps the one matching the best
+    # stand-alone B/C variant as "shrink30+A+best".
+    "shrink30+A+B15": EngineConfig(**S30, position_kappa=True, neff_floor=15),
+    "shrink30+A+B25": EngineConfig(**S30, position_kappa=True, neff_floor=25),
+    "shrink30+A+C": EngineConfig(**S30, position_kappa=True, smooth_bootstrap=True),
 }
+BC_CANDIDATES = ["shrink30+B15", "shrink30+B25", "shrink30+C"]
+TAIL_OFFSETS = (1.5, 2.5, 3.5)
 
 
 @dataclass
@@ -37,7 +48,13 @@ class SeriesInfo:
 
 
 def primary_market(best_of: int) -> str:
-    return "Map 1" if best_of == 1 else "Maps 1-2"
+    """The market actually bet: Map 1 (BO1), Maps 1-2 (BO3), Maps 1-3 (BO5)."""
+    return {1: "Map 1", 3: "Maps 1-2", 5: "Maps 1-3"}[best_of]
+
+
+def market_range(market: str) -> tuple[int, int]:
+    from src.engine.sim import parse_market
+    return parse_market(market, 5)
 
 
 def build_series(players: pd.DataFrame, teams: pd.DataFrame) -> list[SeriesInfo]:
@@ -78,7 +95,7 @@ def build_series(players: pd.DataFrame, teams: pd.DataFrame) -> list[SeriesInfo]
 
 
 def _range_actual(kills: list, market: str) -> int | None:
-    lo, hi = (1, 1) if market == "Map 1" else (1, 2)
+    lo, hi = market_range(market)
     vals = kills[lo - 1:hi]
     if len(vals) < hi - lo + 1 or any(v is None for v in vals):
         return None  # player missed a map in the range: prop would be void
@@ -87,21 +104,33 @@ def _range_actual(kills: list, market: str) -> int | None:
 
 def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | None = None,
                  warmup_days: int = 75, n_sims: int = 20_000, seed: int = 2024,
-                 kappa_refit_days: int = 30, verbose: bool = True) -> pd.DataFrame:
+                 refit_days: int = 30, eval_start: pd.Timestamp | None = None,
+                 verbose: bool = True) -> pd.DataFrame:
+    """Score every series after the warmup (and after eval_start, if given).
+
+    Elo and history always run over the full period, so eval_start only limits which
+    series are scored (used by --quick).
+    """
     variants = variants or VARIANTS
     hist = History(players, teams)
     series = build_series(players, teams)
     elo = Elo()
     t0 = series[0].start + pd.Timedelta(days=warmup_days) if series else None
+    if eval_start is not None:
+        t0 = max(t0, pd.Timestamp(eval_start))
     rows = []
-    kappa, kappa_at = None, None
+    kappa = kappa_at = kappa_pos = nb_r = None
+    need_pos = any(v.position_kappa for v in variants.values())
+    need_nb = any(v.smooth_bootstrap for v in variants.values())
     tic = time.time()
     for i, s in enumerate(series):
         p_map = elo.p_map(s.team_a, s.team_b, s.league)
         if s.start >= t0:
             cutoff = int(s.start.value)
-            if kappa is None or (s.start - kappa_at).days >= kappa_refit_days:
+            if kappa is None or (s.start - kappa_at).days >= refit_days:
                 kappa, kappa_at = fit_kappa(hist, cutoff), s.start
+                kappa_pos = fit_kappa_by_position(hist, cutoff) if need_pos else None
+                nb_r = fit_nb_dispersion(hist, cutoff, s.patch) if need_nb else None
             market = primary_market(s.best_of)
             seed_i = seed + i
             naive = {}
@@ -113,7 +142,7 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
                         mu = POSITION_PRIORS[pos] * env.get(s.league, env["_global"]) * 0.97
                     naive[pl] = mu
             for vname, vcfg in variants.items():
-                cfg = replace(vcfg, kappa=kappa)
+                cfg = replace(vcfg, kappa=kappa, kappa_pos=kappa_pos, nb_r=nb_r)
                 params = build_matchup(hist, s.team_a, s.team_b, s.league, s.best_of, p_map,
                                        s.lineups, cutoff, s.patch, cfg)
                 sim = simulate_series(params, n_sims=n_sims, rng=seed_i)
@@ -141,9 +170,15 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
                             rec[f"hl{j}"] = hl
                             rec[f"hl{j}_p"] = float((k > hl).mean()) if ok else np.nan
                             rec[f"hl{j}_y"] = int(y > hl) if ok else np.nan
+                        # upper-tail lines: rounded median + 1.5, 2.5, 3.5
+                        for j, off in enumerate(TAIL_OFFSETS):
+                            tl = line + off
+                            rec[f"tl{j}_p"] = float((k > tl).mean())
+                            rec[f"tl{j}_y"] = int(y > tl)
                         rows.append(rec)
                         if vname == next(iter(variants)):
-                            nmaps = 1 if market == "Map 1" else 2
+                            lo, hi = market_range(market)
+                            nmaps = hi - lo + 1
                             c, lsc = poisson_scores(naive[pl] * nmaps, y)
                             rows.append(dict(variant="naive_poisson", series_id=s.series_id,
                                              date=s.start, league=s.league,
@@ -161,21 +196,30 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
     return pd.DataFrame(rows)
 
 
-def summarize(res: pd.DataFrame) -> tuple[pd.DataFrame, dict, dict]:
-    """Variant table, calibration tables at the median line, and multi-line calibration."""
+def pick_best_combo(table: pd.DataFrame) -> str | None:
+    """Name of the A+{B15,B25,C} variant matching the best stand-alone B/C (by CRPS)."""
+    cand = table[table["variant"].isin(BC_CANDIDATES)]
+    if cand.empty:
+        return None
+    best = cand.sort_values("crps")["variant"].iloc[0]
+    return "shrink30+A+" + best.split("+", 1)[1]
+
+
+def summarize(res: pd.DataFrame) -> dict:
+    """Variant table, calibration tables (median line, half-point lines) and tail report."""
     out = []
     for v, g in res.groupby("variant", sort=False):
         row = dict(variant=v, n=len(g), crps=g["crps"].mean(), logscore=g["logscore"].mean(),
                    bias=(g["mean"] - g["y"]).mean())
         if "p_over" in g and g["p_over"].notna().any():
+            tp, ty = _tail_lines(g)
             row.update(
                 brier_median_line=((g["p_over"] - g["over"]) ** 2).mean(),
                 ece_median_line=ece(g["p_over"], g["over"]),
-                pred_over=g["p_over"].mean(), obs_over=g["over"].mean(),
                 pred_push=g["p_push"].mean(), obs_push=g["push"].mean(),
+                ece_multi_line=ece(*_multi_line(g)),
+                tail_pred=tp.mean(), tail_obs=ty.mean(),
             )
-            ml_p, ml_y = _multi_line(g)
-            row["ece_multi_line"] = ece(ml_p, ml_y)
         out.append(row)
     table = pd.DataFrame(out)
 
@@ -189,11 +233,47 @@ def summarize(res: pd.DataFrame) -> tuple[pd.DataFrame, dict, dict]:
     table["crps_vs_base"] = [d[0] for d in diffs]
     table["crps_vs_base_se"] = [d[1] for d in diffs]
 
+    combo = pick_best_combo(table)
+    table["note"] = ""
+    if combo is not None and combo in set(table["variant"]):
+        table.loc[table["variant"] == combo, "note"] = "shrink30+A+best"
+        others = [v for v in table["variant"] if v.startswith("shrink30+A+") and v != combo]
+        table.loc[table["variant"].isin(others), "note"] = "not selected"
+
     calib, multi = {}, {}
-    for v, g in res[res["variant"] != "naive_poisson"].groupby("variant", sort=False):
+    model = res[res["variant"] != "naive_poisson"]
+    for v, g in model.groupby("variant", sort=False):
         calib[v] = calibration_table(g["p_over"], g["over"])
         multi[v] = calibration_table(*_multi_line(g))
-    return table, calib, multi
+    return {"table": table, "calib": calib, "multi": multi, "tail": tail_report(model),
+            "combo": combo}
+
+
+def tail_report(res: pd.DataFrame) -> pd.DataFrame:
+    """Calibration of P(over) at lines >= rounded median + 1.5, by variant and position."""
+    parts = []
+    for j, off in enumerate(TAIL_OFFSETS):
+        parts.append(pd.DataFrame({
+            "variant": res["variant"].values, "position": res["position"].values,
+            "offset": off, "p": res[f"tl{j}_p"].values, "y": res[f"tl{j}_y"].values}))
+    t = pd.concat(parts, ignore_index=True)
+    rows = []
+    for (v, pos), g in t.groupby(["variant", "position"], sort=False):
+        pred, obs, n = g["p"].mean(), g["y"].mean(), len(g)
+        rows.append(dict(variant=v, position=pos, n=n, pred=pred, obs=obs, diff=obs - pred,
+                         se=np.sqrt(obs * (1 - obs) / n), obs_over_pred=obs / pred
+                         if pred > 0 else np.nan))
+    for v, g in t.groupby("variant", sort=False):
+        pred, obs, n = g["p"].mean(), g["y"].mean(), len(g)
+        rows.append(dict(variant=v, position="ALL", n=n, pred=pred, obs=obs, diff=obs - pred,
+                         se=np.sqrt(obs * (1 - obs) / n), obs_over_pred=obs / pred))
+    return pd.DataFrame(rows)
+
+
+def _tail_lines(g: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    p = pd.concat([g[f"tl{j}_p"] for j in range(len(TAIL_OFFSETS))], ignore_index=True)
+    y = pd.concat([g[f"tl{j}_y"] for j in range(len(TAIL_OFFSETS))], ignore_index=True)
+    return p, y
 
 
 def _multi_line(g: pd.DataFrame) -> tuple[pd.Series, pd.Series]:

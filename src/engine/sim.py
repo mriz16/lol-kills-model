@@ -82,14 +82,20 @@ def simulate_series(params: MatchupParams, n_sims: int = N_SIMS,
         l_draw = _draw(rng, params.pools[s][0], (S, M))
         x = np.where(won, w_draw, l_draw) * params.script_mult
         x = np.maximum(x, 0.0)
-        base = np.floor(x)
-        k = base + (rng.random((S, M)) < (x - base))   # stochastic rounding keeps the mean
+        if params.nb_r is None:
+            base = np.floor(x)
+            k = base + (rng.random((S, M)) < (x - base))  # stochastic rounding keeps mean
+        else:  # toggle C: smoothed bootstrap, NB kernel centred on the drawn value
+            r = params.nb_r
+            k = rng.negative_binomial(r, r / (r + x))
         team_kills[:, :, s] = np.where(played, k, 0).astype(np.int64)
 
     # (f) Dirichlet-multinomial allocation to the five players
     player_kills = np.zeros((S, M, 2, 5), dtype=np.int64)
     for s in (0, 1):
         g = rng.standard_gamma(params.alpha[s], size=(S, M, 5))
+        if params.scale is not None:
+            g = g * params.scale[s]
         shares = g / g.sum(axis=-1, keepdims=True)
         player_kills[:, :, s, :] = rng.multinomial(team_kills[:, :, s], shares)
 

@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 9 * * *"   # daily, 09:17 UTC
   workflow_dispatch:
+    inputs:
+      years:
+        description: "Space-separated years to download (default: last + current)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -15,6 +20,10 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    env:
+      # Repo variable (Settings -> Secrets and variables -> Actions -> Variables).
+      # Empty falls back to the default folder id in scripts/refresh_data.py.
+      OE_DRIVE_FOLDER_ID: ${{ vars.OE_DRIVE_FOLDER_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,13 +31,27 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Download OE data and write parquet
-        run: python scripts/refresh_data.py
-      - name: Commit updated parquet
+      - name: Download OE data, audit, write parquet
+        # Exits non-zero (failing the job) on HTML downloads, 0 rows, missing OE columns,
+        # no in-scope games, or parquet over 50 MB.
+        env:
+          YEARS: ${{ inputs.years }}
+        run: |
+          if [ -n "$YEARS" ]; then
+            [[ "$YEARS" =~ ^[0-9\ ]+$ ]] || { echo "::error::years must be digits/spaces"; exit 1; }
+            python scripts/refresh_data.py --years $YEARS
+          else
+            python scripts/refresh_data.py
+          fi
+      - name: Publish audit to job summary
+        if: always()
+        run: |
+          if [ -f reports/data_audit.md ]; then cat reports/data_audit.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Commit updated parquet and audit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/players.parquet data/teams.parquet
+          git add data/players.parquet data/teams.parquet reports/data_audit.md
           if git diff --cached --quiet; then
             echo "no data changes"
           else

@@ -27,6 +27,14 @@ TEAM_COLUMNS = [
 ]
 
 
+# Columns kept in the committed parquet (everything the engine/backtest reads).
+SERIES_COLUMNS = ["series_id", "map_no", "best_of", "series_complete", "patch_ord"]
+PLAYER_KEEP = ["gameid", "league", "date", "patch", "side", "position", "playername",
+               "teamname", "result", "kills", "teamkills"] + SERIES_COLUMNS
+TEAM_KEEP = ["gameid", "league", "date", "patch", "side", "teamname", "gamelength",
+             "result", "teamkills", "teamdeaths"] + SERIES_COLUMNS
+
+
 def patch_key(patch) -> tuple:
     """Sortable key for OE patch values ("14.01", 14.1, "25.S1.1" ...)."""
     if patch is None or (isinstance(patch, float) and np.isnan(patch)):
@@ -119,7 +127,7 @@ def process(raw: pd.DataFrame, leagues=LEAGUES) -> tuple[pd.DataFrame, pd.DataFr
     teams = teams.merge(series, on="gameid")
     players = players.merge(series, on="gameid")
     add_patch_ordinal(teams, players)
-    return compact(players), compact(teams)
+    return compact(players[PLAYER_KEEP]), compact(teams[TEAM_KEEP])
 
 
 def compact(df: pd.DataFrame) -> pd.DataFrame:

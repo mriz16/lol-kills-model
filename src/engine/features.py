@@ -24,6 +24,15 @@ class EngineConfig:
     game_script: bool = False
     game_script_clamp: tuple = C.GAME_SCRIPT_CLAMP
     kappa: float = C.DEFAULT_KAPPA
+    # --- upper-tail toggles (all off by default; see CLAUDE.md) ---
+    # A) per-position concentration (normalized gammas with per-position scale)
+    position_kappa: bool = False
+    kappa_pos: dict | None = None      # fitted; None -> fit on the fly when enabled
+    # B) Kish effective-sample floor: blend toward league W/L pool until n_eff >= floor
+    neff_floor: float = 0.0            # 0 = off
+    # C) smoothed bootstrap: NB(mean = drawn value, r = league dispersion)
+    smooth_bootstrap: bool = False
+    nb_r: dict | None = None           # league -> r; None -> fit on the fly when enabled
     position_priors: dict = field(default_factory=lambda: dict(C.POSITION_PRIORS))
 
 
@@ -39,6 +48,10 @@ class MatchupParams:
     players: list                # [[5 names], [5 names]] in POSITIONS order
     script_mult: float = 1.0
     info: dict = field(default_factory=dict)
+    # gamma scale per player for the share draw; all-ones = plain Dirichlet(alpha)
+    scale: np.ndarray | None = None
+    # NB dispersion for the smoothed bootstrap; None = stochastic rounding
+    nb_r: float | None = None
 
 
 class History:
@@ -65,6 +78,7 @@ class History:
         self.p_patch = p["patch_ord"].values.astype(np.int32)
         self.p_kills = p["kills"].values.astype(float)
         self.p_teamkills = p["teamkills"].values.astype(float)
+        self.p_pos = p["position"].astype(str).values
         self.player_idx = _index(self.p_player)
         self.leagues = sorted(self.league_idx)
 
@@ -196,6 +210,28 @@ def fit_kappa(hist: History, cutoff: int, n_rows: int = 30000) -> float:
     df = pd.DataFrame({"k": k, "K": K, "pl": pl})
     sums = df.groupby("pl")[["k", "K"]].transform("sum")
     p = (sums["k"] / sums["K"].where(sums["K"] > 0)).fillna(0.2).values
+    return _mom_kappa(k, K, p)
+
+
+def fit_kappa_by_position(hist: History, cutoff: int, n_rows: int = 30000) -> dict:
+    """Toggle A: method-of-moments concentration fitted separately per position."""
+    end = np.searchsorted(hist.p_time, cutoff, side="left")
+    sl = slice(max(0, end - n_rows), end)
+    k, K = hist.p_kills[sl], hist.p_teamkills[sl]
+    pl, pos = hist.p_player[sl], hist.p_pos[sl]
+    out = {}
+    if len(k) < 500:
+        return {p: C.DEFAULT_KAPPA for p in C.POSITIONS}
+    df = pd.DataFrame({"k": k, "K": K, "pl": pl})
+    sums = df.groupby("pl")[["k", "K"]].transform("sum")
+    p = (sums["k"] / sums["K"].where(sums["K"] > 0)).fillna(0.2).values
+    for position in C.POSITIONS:
+        m = pos == position
+        out[position] = _mom_kappa(k[m], K[m], p[m]) if m.sum() >= 100 else C.DEFAULT_KAPPA
+    return out
+
+
+def _mom_kappa(k, K, p) -> float:
     resid = np.sum((k - K * p) ** 2)
     base = K * p * (1 - p)
     if resid <= base.sum():
@@ -214,6 +250,74 @@ def fit_kappa(hist: History, cutoff: int, n_rows: int = 30000) -> float:
         else:
             hi = mid
     return float(np.sqrt(lo * hi))
+
+
+def fit_nb_dispersion(hist: History, cutoff: int, patch: int,
+                      cfg: EngineConfig | None = None) -> dict:
+    """Toggle C: per-league NB dispersion r of team kills around their (team, outcome) mean.
+
+    Var = mu + mu^2 / r, fitted by method of moments on the within-(team, result) variance
+    of prior games in the patch lookback window. Returns {league: r, "_global": r}.
+    """
+    cfg = cfg or EngineConfig()
+    end = np.searchsorted(hist.t_time, cutoff, side="left")
+    idx = np.arange(max(0, end - 8000), end)
+    keep, _ = hist._weights(hist.t_patch[idx], patch, cfg)
+    idx = idx[keep]
+    df = pd.DataFrame({"lg": hist.t_league[idx], "tm": hist.t_team[idx],
+                       "res": hist.t_result[idx], "x": hist.t_kills[idx]})
+
+    def r_of(d: pd.DataFrame) -> float:
+        g = d.groupby(["tm", "res"])["x"]
+        n = g.transform("size")
+        d = d[n >= 2]
+        if len(d) < 30:
+            return np.nan
+        dev = d["x"] - d.groupby(["tm", "res"])["x"].transform("mean")
+        n_groups = d.groupby(["tm", "res"]).ngroups
+        var = float(np.sum(dev ** 2) / max(1, len(d) - n_groups))
+        mu = float(d["x"].mean())
+        if var <= mu:
+            return 1000.0
+        return float(np.clip(mu ** 2 / (var - mu), 1.0, 1000.0))
+
+    glob = r_of(df)
+    out = {"_global": 30.0 if np.isnan(glob) else glob}
+    for lg, d in df.groupby("lg"):
+        r = r_of(d)
+        out[lg] = out["_global"] if np.isnan(r) else r
+    return out
+
+
+def kish_neff(w: np.ndarray) -> float:
+    s = w.sum()
+    return float(s * s / np.sum(w * w)) if s > 0 else 0.0
+
+
+def _blend_to_floor(vals, wts, lvals, lwts, floor):
+    """Toggle B: mix team pool (weight lam) with league pool (1-lam), max lam with
+    Kish n_eff >= floor. Returns (values, probs, lam)."""
+    ne_t = kish_neff(wts)
+    if ne_t >= floor or len(lvals) == 0:
+        return vals, wts / wts.sum(), 1.0
+    ne_l = kish_neff(lwts)
+
+    def ne(lam):
+        return 1.0 / (lam ** 2 / ne_t + (1 - lam) ** 2 / ne_l)
+
+    if ne_l < floor:  # league pool can't reach the floor: use the lam maximizing n_eff
+        lam = ne_t / (ne_t + ne_l)
+    else:
+        lo, hi = 0.0, 1.0  # ne(0) = ne_l >= floor > ne(1) = ne_t
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            if ne(mid) >= floor:
+                lo = mid
+            else:
+                hi = mid
+        lam = lo
+    p = np.concatenate([wts / wts.sum() * lam, lwts / lwts.sum() * (1 - lam)])
+    return np.concatenate([vals, lvals]), p, lam
 
 
 def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of: int,
@@ -237,6 +341,15 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
     g_norm = hist.t_kills[g_idx] / env_of(hist.t_league[g_idx]) if len(g_idx) else g_idx
 
     info = {"target_env": target, "envs": envs}
+    if cfg.neff_floor > 0:
+        lg_rows = hist.league_idx.get(league)
+        if lg_rows is None or league in C.INTERNATIONAL_LEAGUES:
+            l_idx, l_w = g_idx, g_w
+        else:
+            l_idx = hist._prior(lg_rows, hist.t_time, cutoff)
+            keep, l_w = hist._weights(hist.t_patch[l_idx], patch, cfg)
+            l_idx, l_w = l_idx[keep], l_w[keep]
+        l_norm = hist.t_kills[l_idx] / env_of(hist.t_league[l_idx]) if len(l_idx) else l_idx
     pools = []
     for s in (0, 1):
         o = 1 - s
@@ -259,6 +372,14 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
             sel = hist.t_result[idx] == outcome
             vals, wts = norm[sel], w[sel]
             n = int(sel.sum())
+            if cfg.neff_floor > 0 and n > 0:
+                lsel = hist.t_result[l_idx] == outcome
+                vals, probs, lam = _blend_to_floor(vals, wts, l_norm[lsel], l_w[lsel],
+                                                   cfg.neff_floor)
+                info[f"neff_lam_{s}_{outcome}"] = lam
+                side_pools[outcome] = (vals * target * adj, probs)
+                info[f"n_pool_{s}_{outcome}"] = n
+                continue
             if n < cfg.min_outcome_pool:
                 gsel = hist.t_result[g_idx] == outcome
                 gv, gw = g_norm[gsel], g_w[gsel]
@@ -282,6 +403,10 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
 
     # (f) player shares from overall pools, shrunk toward position priors
     alpha = np.zeros((2, 5))
+    scale = np.ones((2, 5))
+    kpos = None
+    if cfg.position_kappa:
+        kpos = cfg.kappa_pos or fit_kappa_by_position(hist, cutoff)
     for s in (0, 1):
         shares = np.zeros(5)
         for j, (pos, pl) in enumerate(zip(C.POSITIONS, lineups[s])):
@@ -291,11 +416,24 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
             shares[j] = prior if np.isnan(obs) else wt * obs + (1 - wt) * prior
             info[f"share_{s}_{j}"] = (shares[j], n)
         shares = np.clip(shares, 1e-3, None)
-        alpha[s] = cfg.kappa * shares / shares.sum()
+        shares = shares / shares.sum()
+        if kpos is None:
+            alpha[s] = cfg.kappa * shares
+        else:
+            # independent Gamma(k_j * s_j, 1/k_j): mean s_j, var s_j / k_j, then normalize
+            kv = np.array([kpos[p] for p in C.POSITIONS])
+            alpha[s] = kv * shares
+            scale[s] = 1.0 / kv
+
+    nb_r = None
+    if cfg.smooth_bootstrap:
+        table = cfg.nb_r or fit_nb_dispersion(hist, cutoff, patch, cfg)
+        nb_r = float(table.get(league, table["_global"]))
+        info["nb_r"] = nb_r
 
     return MatchupParams(teams=teams, best_of=best_of, p_map=float(p_map), pools=pools,
                          alpha=alpha, players=[list(lineups[0]), list(lineups[1])],
-                         script_mult=script, info=info)
+                         script_mult=script, info=info, scale=scale, nb_r=nb_r)
 
 
 def _game_script(hist, rows, league, envs, env_of, cutoff, patch, cfg) -> float:
