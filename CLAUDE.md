@@ -84,3 +84,12 @@ src/engine/                 odds, history/features, sim, props/slips
 src/backtest/               elo, metrics, walk-forward runner
 tests/                      pytest (fixture in tests/fixtures/)
 ```
+
+## Status
+- Phase 1 built; gate report in `reports/backtest_synthetic.md` (synthetic data only:
+  Google Drive / oracleselixir.com were blocked in the build sandbox). Re-run on real OE
+  data with `python scripts/refresh_data.py && python scripts/run_backtest.py`.
+- Game-script toggle: OFF (hurt CRPS on the synthetic backtest).
+- Open issue: predicted right tails are too thin (lines above the median hit more often
+  than predicted), mostly sup/top. Suspected cause: small effective bootstrap pool under
+  0.65 patch decay. Fix needs user sign-off (locked decision).
