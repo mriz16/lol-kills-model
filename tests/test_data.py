@@ -101,3 +101,58 @@ def test_lta_north_maps_to_lcs(raw):
     players, teams = oe.process(raw.assign(league=raw["league"].mask(lcs, "LTA N")))
     assert "LCS" in set(teams["league"].astype(str))
     assert "LTA N" not in set(teams["league"].astype(str))
+
+
+def _lpl_partial(raw, n=4):
+    """Relabel the first n LCK games as LPL 'partial' (team rows stripped of teamkills)."""
+    lck = raw[(raw["league"] == "LCK") & (raw["datacompleteness"] == "complete")]
+    ids = list(dict.fromkeys(lck["gameid"]))[:n]
+    r = raw.copy()
+    m = r["gameid"].isin(ids)
+    r.loc[m, "league"] = "LPL"
+    r.loc[m, "datacompleteness"] = "partial"
+    r.loc[m, ["teamkills", "teamdeaths"]] = None  # OE partial rows may lack these
+    r.loc[m & (r["position"] == "team"), "kills"] = \
+        raw.loc[m & (raw["position"] == "team"), "teamkills"]
+    return r, ids
+
+
+def test_partial_check_and_keep(raw):
+    from src.data.oe import partial_check, process
+    r, ids = _lpl_partial(raw)
+    # game 1: a player's deaths missing; game 2: player kills don't sum to team kills
+    p1 = r.index[(r["gameid"] == ids[1]) & (r["position"] == "mid")][0]
+    r.loc[p1, "deaths"] = None
+    p2 = r.index[(r["gameid"] == ids[2]) & (r["position"] == "top")][0]
+    r.loc[p2, "kills"] = r.loc[p2, "kills"] + 1
+    chk = partial_check(r).set_index("gameid")
+    assert chk.loc[ids[0], "passed"] and chk.loc[ids[3], "passed"]
+    assert chk.loc[ids[1], "reason"].startswith("null player")
+    assert chk.loc[ids[2], "reason"] == "player kills != team kills"
+    assert "FST" not in set(chk["league"])  # only PARTIAL_OK_LEAGUES are checked
+
+    players, teams = process(r)
+    kept = set(teams["gameid"])
+    assert {ids[0], ids[3]} <= kept and not ({ids[1], ids[2]} & kept)
+    assert teams.loc[teams["gameid"].isin([ids[0], ids[3]]), "partial"].all()
+    assert not teams.loc[~teams["gameid"].isin(ids), "partial"].any()
+    # team kills / deaths filled from the player rows
+    g = teams[teams["gameid"] == ids[0]].sort_values("side")
+    pk = players[players["gameid"] == ids[0]].groupby("side", observed=True)["kills"].sum()
+    assert list(g["teamkills"]) == list(pk.sort_index())
+    assert list(g["teamdeaths"]) == list(pk.sort_index())[::-1]
+    pl = players[players["gameid"] == ids[0]]
+    assert (pl["teamkills"] == pl["side"].astype(str).map(pk)).all()
+    assert set(g["result"]) == {0, 1}
+
+
+def test_audit_reports_partial(raw):
+    from src.data.audit import audit
+    from src.data.oe import process
+    r, ids = _lpl_partial(raw)
+    p2 = r.index[(r["gameid"] == ids[2]) & (r["position"] == "top")][0]
+    r.loc[p2, "kills"] = r.loc[p2, "kills"] + 1
+    players, teams = process(r)
+    text, _ = audit(r, players, teams)
+    assert "LPL 2025 partial games: 3 pass, 1 fail" in text
+    assert "player kills != team kills" in text

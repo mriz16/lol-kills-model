@@ -6,7 +6,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from src.config import LEAGUE_CODE_ALIASES, LEAGUES, POSITIONS
+from src.config import LEAGUE_CODE_ALIASES, LEAGUES, PARTIAL_OK_LEAGUES, POSITIONS
 
 REQUIRED_COLUMNS = [
     "gameid", "datacompleteness", "league", "year", "split", "playoffs", "date", "game",
@@ -18,21 +18,22 @@ REQUIRED_COLUMNS = [
 PLAYER_COLUMNS = [
     "gameid", "league", "year", "split", "playoffs", "date", "game", "patch", "side",
     "position", "playername", "playerid", "teamname", "teamid", "champion", "gamelength",
-    "result", "kills", "deaths", "assists", "teamkills", "teamdeaths",
+    "result", "kills", "deaths", "assists", "teamkills", "teamdeaths", "partial",
 ]
 TEAM_COLUMNS = [
     "gameid", "league", "year", "split", "playoffs", "date", "game", "patch", "side",
     "teamname", "teamid", "gamelength", "result", "kills", "deaths", "assists",
-    "teamkills", "teamdeaths",
+    "teamkills", "teamdeaths", "partial",
 ]
 
 
 # Columns kept in the committed parquet (everything the engine/backtest reads).
 SERIES_COLUMNS = ["series_id", "map_no", "best_of", "series_complete", "patch_ord"]
+# partial: game is datacompleteness == "partial" and passed partial_check (LPL 2025).
 PLAYER_KEEP = ["gameid", "league", "date", "patch", "side", "position", "playername",
-               "teamname", "result", "kills", "teamkills"] + SERIES_COLUMNS
+               "teamname", "result", "kills", "teamkills", "partial"] + SERIES_COLUMNS
 TEAM_KEEP = ["gameid", "league", "date", "patch", "side", "teamname", "gamelength",
-             "result", "teamkills", "teamdeaths"] + SERIES_COLUMNS
+             "result", "teamkills", "teamdeaths", "partial"] + SERIES_COLUMNS
 
 
 def patch_key(patch) -> tuple:
@@ -55,13 +56,93 @@ def add_patch_ordinal(*frames: pd.DataFrame) -> None:
         f["patch_ord"] = f["patch"].map(lambda p: ordmap[patch_key(p)]).astype("int16")
 
 
+PARTIAL_PLAYER_FIELDS = ["kills", "deaths", "assists", "result", "gamelength"]
+
+
+def partial_check(raw: pd.DataFrame, leagues=PARTIAL_OK_LEAGUES) -> pd.DataFrame:
+    """Per-game verdict for "partial" games in `leagues` (league codes already aliased).
+
+    A game passes only if it has 2 team + 10 player rows, kills/deaths/assists/result/
+    gamelength are non-null for all 10 players, every player has a name, and the sum of
+    player kills equals team kills on both sides (team row `teamkills`, else `kills`).
+    Returns one row per game: gameid, league, year, passed, reason ("" when passed).
+    """
+    cols = ["gameid", "league", "year", "passed", "reason"]
+    part = raw[(raw["datacompleteness"] == "partial") & raw["league"].isin(leagues)]
+    if part.empty:
+        return pd.DataFrame(columns=cols)
+    is_team = part["position"] == "team"
+    pl = part[part["position"].isin(POSITIONS)]
+    tm = part[is_team]
+    g = part.groupby("gameid").agg(league=("league", "first"), year=("year", "first"))
+    g["n_team"] = tm.groupby("gameid").size()
+    g["n_player"] = pl.groupby("gameid").size()
+    g = g.fillna({"n_team": 0, "n_player": 0})
+    null_stats = pl[PARTIAL_PLAYER_FIELDS].isna().any(axis=1).groupby(pl["gameid"]).any()
+    null_name = pl["playername"].isna().groupby(pl["gameid"]).any()
+    pk = pd.to_numeric(pl["kills"], errors="coerce").groupby(
+        [pl["gameid"], pl["side"]]).sum(min_count=1)
+    team_k = pd.to_numeric(tm["teamkills"], errors="coerce").fillna(
+        pd.to_numeric(tm["kills"], errors="coerce"))
+    tk = team_k.groupby([tm["gameid"], tm["side"]]).first()
+    both = pd.concat({"pk": pk, "tk": tk}, axis=1)
+    mismatch = (both["pk"] != both["tk"]).groupby(level=0).any()  # NaN != x -> mismatch
+
+    reason = pd.Series("", index=g.index, dtype=object)
+    checks = [  # first failing check wins
+        ((g["n_team"] != 2) | (g["n_player"] != 10), "row count != 2 team + 10 player"),
+        (null_stats.reindex(g.index, fill_value=True), "null player kills/deaths/assists/"
+                                                       "result/gamelength"),
+        (null_name.reindex(g.index, fill_value=True), "null playername"),
+        (mismatch.reindex(g.index, fill_value=True), "player kills != team kills"),
+    ]
+    for bad, why in reversed(checks):
+        reason[bad.astype(bool)] = why
+    g["reason"] = reason
+    g["passed"] = reason == ""
+    return g.reset_index()[cols]
+
+
+def _fill_partial(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill team-level fields of partial games that passed partial_check from the player
+    rows: teamkills/teamdeaths (player and team rows), team-row result and gamelength."""
+    part = df["partial"]
+    if not part.any():
+        return df
+    df = df.copy()
+    pl = df[part & df["position"].isin(POSITIONS)]
+    k = pd.to_numeric(pl["kills"], errors="coerce").groupby([pl["gameid"], pl["side"]]).sum()
+    glen = pl.groupby("gameid")["gamelength"].first()
+    key = pd.MultiIndex.from_arrays([df["gameid"], df["side"]])
+    other = df["side"].map({"Blue": "Red", "Red": "Blue"})
+    okey = pd.MultiIndex.from_arrays([df["gameid"], other])
+    own = pd.Series(k.reindex(key).values, index=df.index)
+    opp = pd.Series(k.reindex(okey).values, index=df.index)
+    for col, fill in (("teamkills", own), ("teamdeaths", opp)):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.loc[part, col] = df.loc[part, col].fillna(fill[part])
+    res = pl.groupby(["gameid", "side"])["result"].first()
+    df["result"] = pd.to_numeric(df["result"], errors="coerce")
+    df.loc[part, "result"] = df.loc[part, "result"].fillna(
+        pd.Series(res.reindex(key).values, index=df.index)[part])
+    df["gamelength"] = pd.to_numeric(df["gamelength"], errors="coerce")
+    df.loc[part, "gamelength"] = df.loc[part, "gamelength"].fillna(
+        df.loc[part, "gameid"].map(glen))
+    return df
+
+
 def filter_raw(raw: pd.DataFrame, leagues=LEAGUES) -> pd.DataFrame:
     missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
     if missing:
         raise ValueError(f"OE data missing columns: {missing}")
     raw = raw.assign(league=raw["league"].replace(LEAGUE_CODE_ALIASES)) \
         if LEAGUE_CODE_ALIASES else raw
-    df = raw[(raw["datacompleteness"] == "complete") & raw["league"].isin(leagues)].copy()
+    chk = partial_check(raw[raw["league"].isin(leagues)])
+    ok_partial = set(chk.loc[chk["passed"], "gameid"])
+    keep = (raw["datacompleteness"] == "complete") | raw["gameid"].isin(ok_partial)
+    df = raw[keep & raw["league"].isin(leagues)].copy()
+    df["partial"] = df["datacompleteness"] != "complete"
+    df = _fill_partial(df)
     df["date"] = pd.to_datetime(df["date"])
     # Drop games that are not exactly 2 team rows + 10 player rows.
     counts = df.groupby("gameid")["position"].agg(
@@ -141,8 +222,9 @@ def compact(df: pd.DataFrame) -> pd.DataFrame:
     for c in ("kills", "deaths", "assists", "teamkills", "teamdeaths"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int16")
-    if "series_complete" in df.columns:
-        df["series_complete"] = df["series_complete"].astype(bool)
+    for c in ("series_complete", "partial"):
+        if c in df.columns:
+            df[c] = df[c].astype(bool)
     for c in ("result", "playoffs", "game", "map_no", "best_of"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int8")

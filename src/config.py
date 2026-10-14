@@ -21,6 +21,12 @@ LEAGUES = DOMESTIC_LEAGUES + INTERNATIONAL_LEAGUES
 # N vs S games), "EWC" (Esports World Cup), "KeSPA Cup".
 LEAGUE_CODE_ALIASES: dict[str, str] = {"LTA N": "LCS", "LTA North": "LCS"}
 
+# Leagues whose datacompleteness == "partial" games are kept when the kill data checks out
+# (src.data.oe.partial_check): kills/deaths/assists/result/gamelength (and playername)
+# non-null for all 10 players and sum of player kills == team kills on both sides.
+# OE marks all of LPL 2025 "partial" (missing non-kill stats). User sign-off 2026-10-14.
+PARTIAL_OK_LEAGUES = ["LPL"]
+
 # Prior multiplier applied to the participants' home-league average when an international
 # event has little measured history. FST is structurally low-kill.
 EVENT_ENV_PRIOR = {"WLDs": 1.00, "Worlds": 1.00, "MSI": 1.00, "FST": 0.88}
