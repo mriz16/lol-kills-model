@@ -15,7 +15,8 @@ least one day before the refit date, refit weekly):
   L+O+K<n0>    per-player share concentration (re-simulated), and K<best>+S+I
 Selection-bias check: per slate (UTC date), bet the top-N edges at proxy lines (player's
 rolling median of the market total + 0.5) and compare hit rate with predicted.
-Also writes data/calib_pairs.parquet (the live app's calibration training set).
+The app's calibration data is written by scripts/refit_calibration.py, not here
+(--pairs-out writes the study's pairs file if wanted).
 """
 from __future__ import annotations
 
@@ -30,17 +31,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.run_backtest import _md  # noqa: E402
 from src.backtest.walkforward import LIVE_LOCKED, TAIL_OFFSETS  # noqa: E402
-from src.config import DATA_DIR, POSITIONS, PRIZEPICKS_POWER, REPORTS_DIR  # noqa: E402
-from src.engine.calibration import (OFFSETS, Calibrator, calibrate_pmf,  # noqa: E402
-                                    fit_spread, inflate_pmf, pairs_from_rows)
+from src.config import DATA_DIR, POSITIONS, REPORTS_DIR  # noqa: E402
+from src.backtest.calib_pipeline import (BE_2L, apply_calibration,  # noqa: E402,F401
+                                         apply_spread, load_rows, proxy_lines)
+from src.engine.calibration import OFFSETS, pairs_from_rows  # noqa: E402
 
 N_SIMS = 20_000
-BE_2L = (1 / PRIZEPICKS_POWER[2]) ** 0.5
 MARKETS = ["Map 1", "Maps 1-2", "Maps 1-3"]
-N_MAPS = {"Map 1": 1, "Maps 1-2": 2, "Maps 1-3": 3}
-PROXY_WINDOW, PROXY_MIN = 10, 5
-REFIT = pd.Timedelta(days=7)
-LAG = pd.Timedelta(days=1)
 
 
 # ------------------------------------------------------------------ pmf metrics ----
@@ -129,93 +126,6 @@ def score(name: str, P: np.ndarray, base: pd.DataFrame) -> tuple[dict, pd.DataFr
     return row, m
 
 
-# ------------------------------------------------------------------ walk-forward ----
-def refit_dates(dates: pd.Series) -> pd.DatetimeIndex:
-    d0 = dates.min().normalize()
-    return pd.date_range(d0, dates.max().normalize() + REFIT, freq=REFIT)
-
-
-def apply_spread(base: pd.DataFrame, P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """S: walk-forward k per position x market (weekly refit) applied to every pmf."""
-    out = P.copy()
-    ks = np.ones(len(base))
-    d = base["date"]
-    fit_rows = base[["date", "position", "market", "y", "mean", "var"]]
-    for t in refit_dates(d):
-        sel = ((d >= t) & (d < t + REFIT)).to_numpy()
-        if not sel.any():
-            continue
-        table = fit_spread(fit_rows[d <= t - LAG])
-        for i in np.flatnonzero(sel):
-            k = table.get((base["position"].iat[i], base["market"].iat[i]), table["_pool"])
-            ks[i] = k
-            if k != 1.0:
-                out[i] = inflate_pmf(P[i], k)
-    return out, ks
-
-
-def apply_calibration(base: pd.DataFrame, P: np.ndarray, method: str) -> np.ndarray:
-    """I: walk-forward calibrator (weekly refit) on pairs from the same pmfs."""
-    pairs = pairs_from_rows(base.assign(pmf=list(P)))
-    pd_dates = pairs["date"]
-    out = P.copy()
-    d = base["date"]
-    for t in refit_dates(d):
-        sel = ((d >= t) & (d < t + REFIT)).to_numpy()
-        if not sel.any():
-            continue
-        cal = Calibrator.fit(pairs[pd_dates <= t - LAG], method)
-        if cal.pool is None:
-            continue
-        for i in np.flatnonzero(sel):
-            out[i] = calibrate_pmf(P[i], cal, base["position"].iat[i], base["market"].iat[i],
-                                   base["line"].iat[i])
-    return out
-
-
-# ------------------------------------------------------------------ proxy lines ----
-def proxy_lines(players: pd.DataFrame) -> pd.DataFrame:
-    """Per (series_id, player, market): floor(rolling median of the player's prior market
-    totals) + 0.5. Prior = series that started strictly earlier; last PROXY_WINDOW
-    qualifying series, at least PROXY_MIN; else n_maps x median of the last 20 maps."""
-    p = players[["series_id", "playername", "map_no", "kills", "date"]].copy()
-    p["series_id"] = p["series_id"].astype(str)
-    p["playername"] = p["playername"].astype(str)
-    p = p.sort_values(["playername", "date", "map_no"])
-    start = p.groupby("series_id")["date"].transform("min")
-    p["start"] = start
-    out = []
-    for pl, g in p.groupby("playername", sort=False):
-        ser = g.groupby("series_id", sort=False).agg(
-            start=("start", "first"), maps=("kills", list), mapno=("map_no", list))
-        ser = ser.sort_values("start")
-        hist = {n: [] for n in (1, 2, 3)}       # prior market totals
-        maps_hist: list = []                      # prior per-map kills
-        prev_start, pending = None, []            # same-start series are not "prior"
-        for sid, r in ser.iterrows():
-            if prev_start is not None and r["start"] > prev_start:
-                for totals, kills in pending:
-                    for n, tot in totals.items():
-                        hist[n].append(tot)
-                    maps_hist.extend(kills)
-                pending = []
-            for mkt, n in N_MAPS.items():
-                h = hist[n][-PROXY_WINDOW:]
-                if len(h) >= PROXY_MIN:
-                    med = float(np.median(h))
-                elif len(maps_hist) >= PROXY_MIN:
-                    med = n * float(np.median(maps_hist[-20:]))
-                else:
-                    med = np.nan
-                out.append((sid, pl, mkt, np.floor(med) + 0.5 if np.isfinite(med) else np.nan))
-            by_map = dict(zip(r["mapno"], r["maps"]))
-            totals = {n: sum(by_map[m] for m in range(1, n + 1)) for n in (1, 2, 3)
-                      if all(m in by_map for m in range(1, n + 1))}
-            pending.append((totals, [by_map[m] for m in sorted(by_map)]))
-            prev_start = r["start"]
-    return pd.DataFrame(out, columns=["series_id", "player", "market", "proxy_line"])
-
-
 def selection_table(base: pd.DataFrame, P: np.ndarray, top_ns=(3, 5, 10, None),
                     min_edge: float = 0.0) -> pd.DataFrame:
     """Top-N edges per slate at proxy lines: predicted vs hit, overall and by side."""
@@ -274,18 +184,7 @@ def threshold_table(b: pd.DataFrame, cuts=(0.0, 0.02, 0.04, 0.06, 0.08, 0.10)) -
 
 
 # ------------------------------------------------------------------ main ----
-def load(paths: list[Path]) -> dict[str, pd.DataFrame]:
-    res = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
-    res = res[res["variant"] != "naive_poisson"]
-    out = {}
-    key = ["series_id", "player"]
-    order = None
-    for v, g in res.groupby("variant", sort=False):
-        g = g.drop_duplicates(key).set_index(key)
-        if order is None:
-            order = g.sort_values("date").index
-        out[v] = g.reindex(order).reset_index()
-    return out
+load = load_rows
 
 
 def paired(a: pd.DataFrame, b: pd.DataFrame, col: str) -> tuple[float, float]:
@@ -298,7 +197,7 @@ def main(argv=None) -> int:
     ap.add_argument("--rows", type=Path, nargs="+", required=True)
     ap.add_argument("--data", type=Path, default=DATA_DIR)
     ap.add_argument("--out", type=Path, default=REPORTS_DIR / "backtest_spread.md")
-    ap.add_argument("--pairs-out", type=Path, default=DATA_DIR / "calib_pairs.parquet")
+    ap.add_argument("--pairs-out", type=Path, default=None)
     args = ap.parse_args(argv)
 
     rows = load(args.rows)
@@ -361,8 +260,9 @@ def main(argv=None) -> int:
     pairs["p"] = pairs["p"].astype("float32")
     pairs["offset"] = pairs["offset"].astype("float32")
     pairs["y"] = pairs["y"].astype("int8")
-    args.pairs_out.parent.mkdir(parents=True, exist_ok=True)
-    pairs.to_parquet(args.pairs_out, index=False)
+    if args.pairs_out:
+        args.pairs_out.parent.mkdir(parents=True, exist_ok=True)
+        pairs.to_parquet(args.pairs_out, index=False)
 
     text = render(base, tab, per_row, sel, sel_b, best_k, pmfs)
     args.out.write_text(text)

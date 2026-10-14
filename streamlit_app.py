@@ -40,7 +40,8 @@ LEAGUE_AUTO = "auto"
 # ============================================================== data (cached) ====
 def data_version() -> str:
     files = [C.DATA_DIR / "players.parquet", C.DATA_DIR / "teams.parquet",
-             C.DATA_DIR / "calib_pairs.parquet"]
+             C.DATA_DIR / "calib_pairs.parquet", C.DATA_DIR / "spread_rows.parquet",
+             C.DATA_DIR / "w_rows.parquet", C.DATA_DIR / "w_lambda_real.json"]
     return "-".join(str(int(f.stat().st_mtime)) + str(f.stat().st_size) for f in files
                     if f.exists())
 
@@ -381,9 +382,9 @@ def screenshot_tab(store: DataStore):
 
 # ============================================================== results tab ====
 FLAG_HELP = {
-    "BELOW MIN": f"calibrated edge under the {100 * MIN_EDGE:.0f}-point minimum: in the "
-                 "backtest the biggest edges per slate hit ~3 points under their "
-                 "calibrated probability",
+    "BELOW MIN": f"shown (W-adjusted) edge under the {100 * MIN_EDGE:.0f}-point minimum: "
+                 "after W the top edges per slate still carry ~1 point of noise (se); "
+                 f"{100 * MIN_EDGE:.0f} points clears it by 2 se",
     "THIN EDGE": f"edge under {100 * THIN_EDGE:.0f} points vs the per-leg breakeven "
                  "(uncalibrated: no minimum edge applied)",
     "LOW SAMPLE": "player has fewer than 20 games in the model window",
@@ -406,8 +407,11 @@ def results_tab():
         f"{p} {legs}L {PLATFORMS[p][legs]:g}x → {per_leg_breakeven(p, legs):.1%}"
         for p in plats))
     calibrated = bool(df["calibrated"].all())
-    raw = st.toggle("Show raw model probabilities", value=False, key="show_raw",
-                    disabled=not calibrated)
+    views = {"Shown": "", "Calibrated": "cal_", "Raw": "raw_"}
+    view_name = st.radio("Probabilities", list(views), horizontal=True, key="prob_view",
+                         disabled=not calibrated,
+                         help="Shown = calibrated (I) then shrunk toward the line (W); "
+                              "Calibrated = I only; Raw = the model's sims (with S).")
     if not calibrated:
         st.warning("No calibration data for this cutoff: raw model probabilities, and no "
                    "PLAY marks (the minimum edge applies only after calibration).")
@@ -416,7 +420,7 @@ def results_tab():
         st.warning(f"Side balance: {bal['share']:.0%} of this slate's {bal['n']} plays are "
                    f"{bal['side'].upper()}. One-sided slates were where the backtest's "
                    "false edges clustered; check the lines before stacking them.")
-    pre = "raw_" if raw else ""
+    pre = views[view_name] if calibrated else ""
     view = pd.DataFrame({
         "play": np.where(df["play"], "✅", ""),
         "player": df["player"], "team": df["team"], "role": df["role"],
@@ -425,8 +429,11 @@ def results_tab():
         "P(less)": 100 * df[f"{pre}p_less"], "P(push)": 100 * df[f"{pre}p_push"],
         "mean": df["mean"], "fair": df["fair_line"], "flags": df["flags"],
     })
-    st.caption(("Raw model probabilities (before calibration)." if raw else
-                f"Calibrated probabilities. ✅ = calibrated edge ≥ {100 * MIN_EDGE:.0f} pts.")
+    st.caption({"": f"Shown probabilities (calibrated + W). ✅ = shown edge ≥ "
+                    f"{100 * MIN_EDGE:.0f} pts.",
+                "cal_": "Calibrated (I) probabilities, before W. ✅ / flags follow Shown.",
+                "raw_": "Raw model probabilities (sims with S, before I and W). ✅ / flags "
+                        "follow Shown."}[pre]
                if calibrated else "Raw model probabilities.")
     pc = st.column_config.NumberColumn(format="%.1f%%")
     ev = st.dataframe(
@@ -497,11 +504,13 @@ def slip_tab():
     c2.metric("Payout", f"{s['payout']:g}x" if s["payout"] else "–")
     c3.metric("EV", f"{s['ev']:+.1%}" if s["ev"] is not None else "–")
     if s["p_joint_raw"] != s["p_joint"]:
-        with st.expander("Raw (uncalibrated) slip"):
-            st.caption(f"Raw joint P {pct(s['p_joint_raw'])}"
-                       + (f", raw EV {s['ev_raw']:+.1%}" if s["ev_raw"] is not None else "")
-                       + ". Calibrated joint = raw shared-sim joint x each leg's "
-                       "calibrated / raw probability.")
+        with st.expander("Calibrated and raw slip"):
+            for lab, pk, ek in (("Calibrated (I, before W)", "p_joint_cal", "ev_cal"),
+                                ("Raw model", "p_joint_raw", "ev_raw")):
+                st.caption(f"{lab}: joint P {pct(s[pk])}"
+                           + (f", EV {s[ek]:+.1%}" if s[ek] is not None else ""))
+            st.caption("Shown / calibrated joint = raw shared-sim joint x each leg's shown "
+                       "/ calibrated over raw probability (capped at the weakest leg).")
     note = f"Raw independent product {pct(s['p_independent'])}."
     if s["payout"]:
         note += f" Breakeven joint P {1 / s['payout']:.1%}."
@@ -590,7 +599,7 @@ def slate_log_section(store: DataStore):
     e = slatelog.evaluate(slates, sgraded)
     st.caption(f"{e['n']} lines: {e.get('n_graded', 0)} graded, {e.get('n_pending', 0)} "
                f"pending, {e.get('n_void', 0)} void. Hit rate of the model side vs its "
-               "predicted P, calibrated and raw.")
+               "predicted P: shown, calibrated and raw.")
     if "table" in e:
         t = e["table"].copy()
         for c in ("pred", "hit", "diff"):
@@ -599,6 +608,11 @@ def slate_log_section(store: DataStore):
         st.dataframe(t, hide_index=True, width="stretch",
                      column_config={"pred": pc, "hit": pc, "diff": pc})
         st.caption(f"Mean bias (model mean - actual): {e['bias']:+.2f} kills.")
+    n_real = len(slatelog.graded_real_rows(slates, sgraded))
+    need = slatelog.REAL_W_MIN_ROWS
+    st.progress(min(1.0, n_real / need),
+                text=f"Graded PrizePicks lines toward the real-line W refit: {n_real} / {need}"
+                + (" (ready: run scripts/refit_w_real.py)" if n_real >= need else ""))
 
 
 # ============================================================== main ====
@@ -618,12 +632,14 @@ try:
 except ValueError as exc:
     st.error(f"Backfill: {exc}")
     st.stop()
-cal_note = "calibrated (beta, I)" if store.calibrated else "uncalibrated"
+cal_note = (f"S + I (beta) + W ({store.w_source})" if store.calibrated
+            else "uncalibrated") if store.spread_k else \
+    ("I (beta) + W, no S data" if store.calibrated else "uncalibrated, no S data")
 if store.backfill:
     st.warning(f"BACKFILL {ASOF}: projections use only games before {ASOF} "
                f"(last game in window {store.last_date:%Y-%m-%d}).")
 st.caption(f"OE data through {store.last_date:%Y-%m-%d} · patch {store.patch_name} · "
-           f"locked model (shrink30 + A + B50 + O), 20,000 sims · {cal_note}")
+           f"locked model (shrink30 + A + B50 + O + S), 20,000 sims · {cal_note}")
 tabs = st.tabs(["Slate", "Screenshot (beta)", "Results", "Slip", "Record"])
 with tabs[0]:
     slate_tab(store)

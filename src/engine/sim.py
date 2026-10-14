@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from src.config import N_SIMS
+from src.config import N_SIMS, POSITIONS
+from src.engine.calibration import inflate_samples
 from src.engine.features import MatchupParams
 
 
@@ -17,6 +18,10 @@ class SeriesSim:
     played: np.ndarray        # (S, M) bool
     team_kills: np.ndarray    # (S, M, 2) int, zero on unplayed maps
     player_kills: np.ndarray  # (S, M, 2, 5) int, zero on unplayed maps
+    # S (locked 2026-10-14): {(position, market): k, "_pool": k}; None = no inflation.
+    # range_kills returns mean + k (x - mean) per sim (calibration.inflate_samples) with a
+    # fixed seed per (player slot, market), so slips see the same inflated arrays.
+    spread_k: dict | None = None
 
     @property
     def n_sims(self) -> int:
@@ -32,7 +37,11 @@ class SeriesSim:
         """Player kills over a market range; only maps actually played count."""
         s, j = self.player_index(player)
         lo, hi = parse_market(market, self.played.shape[1])
-        return self.player_kills[:, lo - 1:hi, s, j].sum(axis=1)
+        k = self.player_kills[:, lo - 1:hi, s, j].sum(axis=1)
+        if self.spread_k:
+            kk = self.spread_k.get((POSITIONS[j], market), self.spread_k.get("_pool", 1.0))
+            k = inflate_samples(k, float(kk), rng=1000 * (5 * s + j) + 10 * lo + hi)
+        return k
 
     def team_range_kills(self, side: int, market: str) -> np.ndarray:
         lo, hi = parse_market(market, self.played.shape[1])

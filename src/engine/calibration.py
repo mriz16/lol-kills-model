@@ -264,3 +264,85 @@ def fit_spread_asof(rows: pd.DataFrame, cutoff,
                     lag: pd.Timedelta = pd.Timedelta(days=1)) -> dict:
     d = pd.to_datetime(rows["date"])
     return fit_spread(rows[d <= pd.Timestamp(cutoff) - lag])
+
+
+# ------------------------------------------------------------------ W: line shrinkage ----
+# Displayed P = p_line + lambda (p_cal - p_line). p_line is the line's push-adjusted implied
+# probability of a side: (1 - P(push)) / 2 (both sides priced alike). lambda per market is
+# fitted so that the top-W_TOP_N edges per slate are calibrated (predicted ~ hit).
+W_TOP_N = 5
+W_MIN_PICKS = 300           # selected picks before lambda departs from 1
+W_SHRINK_PICKS = 150        # market lambda weight n / (n + this), rest = pooled lambda
+W_CLIP = (0.2, 1.2)
+MARKETS = ("Map 1", "Maps 1-2", "Maps 1-3")
+
+
+def w_adjust(p_more, p_less, p_push, lam):
+    """(more, less) after W. Keeps P(more) + P(less) = 1 - P(push) and the side order."""
+    p_line = (1.0 - np.asarray(p_push, dtype=float)) / 2.0
+    return (p_line + lam * (np.asarray(p_more, dtype=float) - p_line),
+            p_line + lam * (np.asarray(p_less, dtype=float) - p_line))
+
+
+def lambda_for(lam: dict | None, market: str) -> float:
+    if not lam:
+        return 1.0
+    return float(lam.get(market, lam.get("_pool", 1.0)))
+
+
+def select_top(rows: pd.DataFrame, lam: dict | None, breakeven: float,
+               top_n: int | None = W_TOP_N) -> pd.DataFrame:
+    """The top_n W-adjusted edges (edge > 0) per slate. rows: slate, market, p_more, p_less,
+    p_push, y, line. Adds side, p_cal (calibrated P of the side), p_line, p_w, edge, hit."""
+    lams = rows["market"].map(lambda m: lambda_for(lam, m)).to_numpy(float)
+    more, less = w_adjust(rows["p_more"], rows["p_less"], rows["p_push"], lams)
+    d = rows.copy()
+    d["side"] = np.where(d["p_more"].to_numpy() >= d["p_less"].to_numpy(), "more", "less")
+    is_more = d["side"].to_numpy() == "more"
+    d["p_cal"] = np.where(is_more, d["p_more"], d["p_less"])
+    d["p_line"] = (1.0 - d["p_push"].to_numpy(float)) / 2.0
+    d["p_w"] = np.where(is_more, more, less)
+    d["edge"] = d["p_w"] - breakeven
+    y, line = d["y"].to_numpy(float), d["line"].to_numpy(float)
+    d["hit"] = np.where(is_more, y > line, y < line).astype(float)
+    d = d[d["edge"] > 0].sort_values("edge", ascending=False)
+    if top_n is not None:
+        d = d.groupby("slate", sort=False).head(top_n)
+    return d
+
+
+def fit_w(rows: pd.DataFrame, breakeven: float, top_n: int = W_TOP_N,
+          iters: int = 20, min_picks: int = W_MIN_PICKS) -> dict:
+    """{market: lambda, "_pool": lambda, "_n": picks}: lambda = sum(hit - p_line) /
+    sum(p_cal - p_line) over the selected picks, re-selected with the new lambda until it
+    settles (selection depends on lambda). Shrunk to the pooled lambda, clipped."""
+    lam = {"_pool": 1.0}
+    if len(rows) == 0:
+        return {"_pool": 1.0, "_n": 0}
+    for _ in range(iters):
+        sel = select_top(rows, lam, breakeven, top_n)
+        if len(sel) < min_picks:
+            return {"_pool": 1.0, "_n": len(sel)}
+
+        def ratio(g):
+            den = float((g["p_cal"] - g["p_line"]).sum())
+            return float((g["hit"] - g["p_line"]).sum()) / den if den > 0 else 1.0
+
+        pool = float(np.clip(ratio(sel), *W_CLIP))
+        new = {"_pool": pool}
+        for m, g in sel.groupby("market"):
+            w = len(g) / (len(g) + W_SHRINK_PICKS)
+            new[m] = float(np.clip(w * ratio(g) + (1 - w) * pool, *W_CLIP))
+        done = all(abs(new.get(k, pool) - lam.get(k, lam["_pool"])) < 1e-4
+                   for k in set(new) | set(lam))
+        lam = new
+        if done:
+            break
+    lam["_n"] = len(select_top(rows, lam, breakeven, top_n))
+    return lam
+
+
+def fit_w_asof(rows: pd.DataFrame, cutoff, breakeven: float,
+               lag: pd.Timedelta = pd.Timedelta(days=1)) -> dict:
+    d = pd.to_datetime(rows["date"])
+    return fit_w(rows[d <= pd.Timestamp(cutoff) - lag], breakeven)

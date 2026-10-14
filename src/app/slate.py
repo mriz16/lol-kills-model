@@ -12,7 +12,10 @@ import pandas as pd
 from src import config as C
 from src.app.names import LineMatch, match_lines
 from src.app.odds_input import odds_summary
-from src.engine.calibration import Calibrator, calibrated_prop, fit_calibrator_asof
+import json
+
+from src.engine.calibration import (Calibrator, calibrated_prop, fit_calibrator_asof,
+                                    fit_spread_asof, fit_w_asof, lambda_for, w_adjust)
 from src.engine.features import (EngineConfig, History, MatchupParams, build_matchup,
                                  fit_kappa_by_position, locked_config)
 from src.engine.props import Leg, breakeven, prop_summary, slip_probability
@@ -24,16 +27,23 @@ ROSTER_DAYS = 60            # players seen for the team in the last N days of it
 THIN_EDGE = 0.03            # uncalibrated fallback only: flag edges under 3 points
 LOW_SAMPLE_GAMES = 20
 CAUTION_P_MORE = 0.25       # "less" at a whole line with P(more) < 25%: overs hit ~9 pts more
-# Probability calibration (toggle I, reports/backtest_spread.md): beta calibration of
-# P(over) per position x market, fitted on the locked model's walk-forward backtest pairs
-# (data/calib_pairs.parquet, model "L+O") from series before the data cutoff.
+# Post-sim layers (reports/backtest_spread.md, reports/calibration_fit.md), all fitted
+# as of the store's cutoff from files written by scripts/refit_calibration.py:
+#  S (locked 2026-10-14): spread k per position x market <- data/spread_rows.parquet
+#  I (display): beta calibration of P(over) on the S pmfs <- data/calib_pairs.parquet
+#  W (display): p_line + lambda (p_cal - p_line) per market <- data/w_rows.parquet, or
+#    data/w_lambda_real.json (refit on real PrizePicks lines, scripts/refit_w_real.py)
+#    for cutoffs after the rows it was fitted on.
 CALIB_PATH = C.DATA_DIR / "calib_pairs.parquet"
-CALIB_MODEL = "L+O"
+SPREAD_PATH = C.DATA_DIR / "spread_rows.parquet"
+W_PATH = C.DATA_DIR / "w_rows.parquet"
+W_REAL_PATH = C.DATA_DIR / "w_lambda_real.json"
+CALIB_MODEL = "L+O+S"
 CALIB_METHOD = "beta"
-# Minimum calibrated edge for a PLAY (reports/backtest_spread.md, selection-bias check:
-# the top edges per slate still hit ~3 pts under their calibrated P, so 5 pts leaves
-# ~2 pts of real edge). Applies only to calibrated probabilities.
-MIN_EDGE = 0.05
+# Minimum W-adjusted edge for a PLAY (reports/calibration_fit.md: after W the top-1/3/5
+# picks per slate are within ~1 pt of their shown P; 3 pts clears that by 2 se). Applies
+# only to calibrated probabilities.
+MIN_EDGE = 0.03
 SIDE_BALANCE = 0.70         # warn when > 70% of a slate's plays are one side
 SIDE_BALANCE_MIN_PLAYS = 3
 
@@ -48,9 +58,13 @@ class DataStore:
     """Processed OE frames + History + rosters, built once per data version."""
 
     def __init__(self, players: pd.DataFrame, teams: pd.DataFrame, asof=None,
-                 calib_pairs: pd.DataFrame | None = None):
+                 calib_pairs: pd.DataFrame | None = None,
+                 spread_rows: pd.DataFrame | None = None,
+                 w_rows: pd.DataFrame | None = None, w_real: dict | None = None):
         """asof (a date): backfill mode. Only games before that date (00:00 UTC) are kept,
-        so pools, rosters, lineups, kappas and the calibrator use prior data only."""
+        so pools, rosters, lineups, kappas and the S / I / W fits use prior data only.
+        calib_pairs / spread_rows / w_rows / w_real default to the files in data/ (pass
+        an empty frame / {} to switch a layer off)."""
         self.asof = pd.Timestamp(asof).normalize() if asof is not None else None
         if self.asof is not None:
             players = players[pd.to_datetime(players["date"]) < self.asof]
@@ -70,6 +84,8 @@ class DataStore:
         # most recently active first: the order of the team pickers
         self.team_names = [str(t) for t in last.sort_values(ascending=False).index]
         self.calibrator = load_calibrator(self.cutoff, calib_pairs)
+        self.spread_k = load_spread(self.cutoff, spread_rows)
+        self.w_lambda, self.w_source = load_w(self.cutoff, w_rows, w_real)
 
     @property
     def backfill(self) -> bool:
@@ -124,6 +140,39 @@ def load_calibrator(cutoff, pairs: pd.DataFrame | None = None) -> Calibrator | N
         pairs = pairs[pairs["model"] == CALIB_MODEL]
     cal = fit_calibrator_asof(pairs, pd.Timestamp(cutoff), CALIB_METHOD)
     return cal if cal.pool is not None else None
+
+
+def _read(df, path):
+    if df is not None:
+        return df
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
+
+
+def load_spread(cutoff, rows: pd.DataFrame | None = None) -> dict | None:
+    """S: {(position, market): k, "_pool": k} from backtest rows before cutoff."""
+    rows = _read(rows, SPREAD_PATH)
+    if rows.empty:
+        return None
+    k = fit_spread_asof(rows, pd.Timestamp(cutoff))
+    return k if len(k) > 1 or k["_pool"] != 1.0 else None
+
+
+def load_w(cutoff, rows: pd.DataFrame | None = None, real: dict | None = None
+           ) -> tuple[dict | None, str]:
+    """W: ({market: lambda, "_pool": lambda}, source). Real-line lambda when its fit ended
+    before the cutoff, else the proxy-line fit as of cutoff."""
+    if real is None and W_REAL_PATH.exists():
+        real = json.loads(W_REAL_PATH.read_text())
+    if real and real.get("lambda") and \
+            pd.Timestamp(cutoff) > pd.Timestamp(real["fitted_through"]) + pd.Timedelta(days=1):
+        return dict(real["lambda"]), f"real PrizePicks lines (n={real.get('n_rows', '?')})"
+    rows = _read(rows, W_PATH)
+    if rows.empty:
+        return None, "none"
+    lam = fit_w_asof(rows, pd.Timestamp(cutoff), per_leg_breakeven("PrizePicks", 2))
+    if lam.get("_n", 0) == 0 and lam["_pool"] == 1.0:
+        return None, "none"
+    return lam, "proxy lines"
 
 
 def _build_rosters(players: pd.DataFrame) -> dict[str, list[dict]]:
@@ -234,8 +283,12 @@ def run_matchup(store: DataStore, m: MatchupInput, legs: int, n_sims: int = C.N_
     league = m.league or store.infer_league(m.team_a, m.team_b)
     sim, params = (sim_fn or simulate_matchup)(store, m, lines, odds, league, n_sims, seed)
     res = MatchupResult(m, league, odds, sim, params, lines)
+    # S is part of the locked model: every range_kills of this sim is inflated
+    sim.spread_k = getattr(store, "spread_k", None)
+    res.sim = sim
     cal = getattr(store, "calibrator", None)
-    res.rows = [prop_row(res, lm, legs, cal) for lm in lines]
+    res.rows = [prop_row(res, lm, legs, cal, getattr(store, "w_lambda", None))
+                for lm in lines]
     return res
 
 
@@ -261,16 +314,20 @@ def _side(p_more: float, p_less: float) -> tuple[str, float]:
 
 
 def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
-             calibrator: Calibrator | None = None) -> dict:
-    """One prop: calibrated P / side / edge (when a calibrator is given) plus raw_*."""
+             calibrator: Calibrator | None = None, w_lambda: dict | None = None) -> dict:
+    """One prop. Shown P / side / edge = W(I(model)) when a calibrator is given; cal_* =
+    I only; raw_* = the model (with S when the sim carries spread_k)."""
     m, sim = res.inp, res.sim
     kills = sim.range_kills(lm.player, m.market)
     s = prop_summary(kills, lm.line)
     cal = calibrated_prop(kills, lm.line, calibrator, lm.role, m.market)
     is_cal = calibrator is not None and calibrator.pool is not None
+    lam = lambda_for(w_lambda, m.market) if is_cal else 1.0
+    w_more, w_less = w_adjust(cal["p_over"], cal["p_under"], cal["p_push"], lam)
     be = per_leg_breakeven(m.platform, legs)
     raw_side, raw_p = _side(s["p_over"], s["p_under"])
-    side, p_side = _side(cal["p_over"], cal["p_under"])
+    cal_side, cal_p = _side(cal["p_over"], cal["p_under"])
+    side, p_side = _side(float(w_more), float(w_less))
     side_idx, j = sim.player_index(lm.player)
     share, n_games = res.params.info.get(f"share_{side_idx}_{j}", (np.nan, 0))
     opp = m.team_b if lm.team == m.team_a else m.team_a
@@ -278,10 +335,13 @@ def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
     row = dict(
         matchup=m.key, platform=m.platform, league=res.league, best_of=int(m.best_of),
         market=m.market, player=lm.player, team=lm.team, opponent=opp, role=lm.role,
-        line=float(lm.line), p_more=cal["p_over"], p_less=cal["p_under"],
+        line=float(lm.line), p_more=float(w_more), p_less=float(w_less),
         p_push=cal["p_push"], mean=s["mean"], median=s["median"],
         fair_line=s["fair_line"], side=side, p_side=p_side, breakeven=be,
-        edge=p_side - be, calibrated=is_cal, raw_side=raw_side, raw_p_more=s["p_over"],
+        edge=p_side - be, calibrated=is_cal, w_lambda=lam,
+        k_spread=_spread_of(sim, lm.role, m.market), cal_side=cal_side,
+        cal_p_more=cal["p_over"], cal_p_less=cal["p_under"], cal_p_push=cal["p_push"],
+        cal_p_side=cal_p, cal_edge=cal_p - be, raw_side=raw_side, raw_p_more=s["p_over"],
         raw_p_less=s["p_under"], raw_p_push=s["p_push"], raw_p_side=raw_p,
         raw_edge=raw_p - be, n_games=int(n_games), share=float(share), p_map=p_map,
     )
@@ -290,6 +350,11 @@ def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
                                       is_cal))
     row["why"] = explain(res, lm, row)
     return row
+
+
+def _spread_of(sim: SeriesSim, role: str, market: str) -> float:
+    k = getattr(sim, "spread_k", None)
+    return float(k.get((role, market), k.get("_pool", 1.0))) if k else 1.0
 
 
 def pool_mean(pool) -> float:
@@ -311,8 +376,10 @@ def explain(res: MatchupResult, lm: LineMatch, row: dict) -> str:
         adj = f"opponent adj x{info.get(f'opp_adj_{s}', 1.0):.2f}"
     n = row["n_games"]
     share = f"{row['share']:.0%}" if np.isfinite(row["share"]) else "prior"
-    raw = (f" Raw model P(more) {row['raw_p_more']:.1%} / P(less) {row['raw_p_less']:.1%}; "
-           f"calibrated {row['p_more']:.1%} / {row['p_less']:.1%}."
+    raw = (f" P(more) / P(less): shown {row['p_more']:.1%} / {row['p_less']:.1%} "
+           f"(W, lambda {row['w_lambda']:.2f}); calibrated {row['cal_p_more']:.1%} / "
+           f"{row['cal_p_less']:.1%}; raw model {row['raw_p_more']:.1%} / "
+           f"{row['raw_p_less']:.1%}."
            if row.get("calibrated") else " Uncalibrated (no calibration data).")
     return (f"{lm.team} projects {win_k:.1f} team kills/map in wins and {loss_k:.1f} in "
             f"losses ({res.league} env {info.get('target_env', float('nan')):.1f}); "
@@ -339,6 +406,7 @@ def rebreakeven(df: pd.DataFrame, legs: int) -> pd.DataFrame:
     df["breakeven"] = [per_leg_breakeven(p, legs) for p in df["platform"]]
     df["edge"] = df["p_side"] - df["breakeven"]
     df["raw_edge"] = df["raw_p_side"] - df["breakeven"]
+    df["cal_edge"] = df["cal_p_side"] - df["breakeven"]
     df["play"] = df["calibrated"].astype(bool) & (df["edge"] >= MIN_EDGE)
     df["flags"] = [" ".join(flags_for(r.side, r.edge, r.p_more, r.line, r.n_games,
                                       bool(r.calibrated)))
@@ -374,23 +442,26 @@ def slip_summary(sims: dict[str, SeriesSim], picks: list[dict], platform: str) -
     n = len(legs)
     table = PLATFORMS[platform]
     mult = table.get(n)
-    # Calibrated joint: the shared-sim joint scaled by each leg's calibrated / raw P
-    # (keeps the within-matchup correlation of the sims), capped at the weakest leg.
+    # Shown (W) and calibrated joints: the shared-sim joint scaled by each leg's shown (or
+    # calibrated) / raw P, which keeps the within-matchup correlation of the sims; capped
+    # at the weakest leg.
     p_raw = sp["p_all_hit"]
-    p_cal = p_raw
-    cal_legs = [p for p in picks if p.get("calibrated") and p.get("raw_p_side")]
-    if cal_legs and len(cal_legs) == len(picks):
-        ratio = np.prod([_leg_p(p, False) / max(_leg_p(p, True), 1e-9) for p in picks])
-        p_cal = float(min(p_raw * ratio, min(_leg_p(p, False) for p in picks)))
-    out = {"n_legs": n, "p_joint": p_cal, "p_joint_raw": p_raw,
-           "p_independent": sp["p_independent"], "payout": mult, "ev": None, "ev_raw": None}
+    joint = {"": p_raw, "cal_": p_raw}
+    if picks and all(p.get("calibrated") and p.get("raw_p_more") is not None for p in picks):
+        for pre in joint:
+            ratio = np.prod([_leg_p(p, pre) / max(_leg_p(p, "raw_"), 1e-9) for p in picks])
+            joint[pre] = float(min(p_raw * ratio, min(_leg_p(p, pre) for p in picks)))
+    out = {"n_legs": n, "p_joint": joint[""], "p_joint_cal": joint["cal_"],
+           "p_joint_raw": p_raw, "p_independent": sp["p_independent"], "payout": mult,
+           "ev": None, "ev_cal": None, "ev_raw": None}
     if mult is not None:
-        out["ev"] = p_cal * mult - 1.0
+        out["ev"] = joint[""] * mult - 1.0
+        out["ev_cal"] = joint["cal_"] * mult - 1.0
         out["ev_raw"] = p_raw * mult - 1.0
     return out
 
 
-def _leg_p(p: dict, raw: bool) -> float:
-    """P of the leg's chosen side, calibrated or raw (the side may differ from the row's)."""
-    pre = "raw_p_" if raw else "p_"
-    return float(p[pre + ("more" if p["side"] == "more" else "less")])
+def _leg_p(p: dict, pre: str) -> float:
+    """P of the leg's chosen side: pre "" shown (W), "cal_" calibrated, "raw_" raw. The
+    leg's side may differ from the row's model side."""
+    return float(p[pre + "p_" + ("more" if p["side"] == "more" else "less")])

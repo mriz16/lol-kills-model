@@ -14,7 +14,8 @@ from src.engine.calibration import (OFFSETS, BetaMap, Calibrator, IsoMap, calibr
                                     calibrated_prop, fit_spread, inflate_pmf,
                                     inflate_samples, pairs_from_rows, pav)
 from src.engine.features import EngineConfig, History, player_kappa
-from scripts.spread_report import pit_hist, pit_stats, pmf_metrics, proxy_lines
+from scripts.spread_report import pit_hist, pit_stats, pmf_metrics
+from src.backtest.calib_pipeline import proxy_lines
 
 RNG = np.random.default_rng(0)
 
@@ -199,7 +200,8 @@ def test_side_balance():
 def _store(processed, asof=None, pairs=None):
     players, teams = processed
     return DataStore(players, teams, asof=asof,
-                     calib_pairs=pairs if pairs is not None else _pairs(10, date="2020-01-01"))
+                     calib_pairs=pairs if pairs is not None else _pairs(10, date="2020-01-01"),
+                     spread_rows=pd.DataFrame(), w_rows=pd.DataFrame(), w_real={})
 
 
 def test_datastore_backfill_uses_prior_data_only(processed):
@@ -239,7 +241,7 @@ def test_calibrated_rows_raw_on_side_and_slip(processed):
         assert r.p_more + r.p_less + r.p_push == pytest.approx(1.0)
         assert r.raw_p_more + r.raw_p_less + r.raw_p_push == pytest.approx(1.0)
         assert r.play == (r.edge >= MIN_EDGE)
-        assert "Raw model P(more)" in r.why
+        assert "raw model" in r.why and "calibrated" in r.why
     assert (df["p_more"] != df["raw_p_more"]).any()
     d5 = rebreakeven(df, 5)
     assert (d5["raw_edge"] == d5["raw_p_side"] - d5["breakeven"]).all()
@@ -303,6 +305,7 @@ def test_grade_slates_anchor_on_slate_date(processed):
     assert list(gr["status"]) == ["win", "loss"] and (gr["actual"] == actual).all()
     e = slatelog.evaluate(sl, gr)
     t = e["table"].set_index(["model", "group"])
+    assert t.loc[("shown", "all"), "hit"] == 0.5
     assert t.loc[("calibrated", "all"), "hit"] == 0.5
     assert t.loc[("raw", "all"), "hit"] == 1.0          # raw said less on r2: right
     assert t.loc[("calibrated", "played"), "n"] == 1

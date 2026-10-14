@@ -275,7 +275,8 @@ def test_log_write_read_github_api():
 @pytest.fixture(scope="module")
 def store(processed):
     # no calibration pairs: raw probabilities, independent of data/calib_pairs.parquet
-    return DataStore(*processed, calib_pairs=pd.DataFrame())
+    return DataStore(*processed, calib_pairs=pd.DataFrame(), spread_rows=pd.DataFrame(),
+                     w_rows=pd.DataFrame(), w_real={})
 
 
 def _fixture_matchup(store, lines=None):

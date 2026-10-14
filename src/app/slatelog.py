@@ -25,8 +25,8 @@ SLATE_COLUMNS = [
     "row_id", "slate_id", "logged_at", "slate_date", "backfill", "data_cutoff",
     "platform", "league", "best_of", "market", "matchup", "team", "opponent", "player",
     "role", "line", "p_map", "calibrated", "side", "p_more", "p_less", "p_push", "p_side",
-    "breakeven", "edge", "raw_side", "raw_p_more", "raw_p_less", "raw_p_push", "raw_edge",
-    "mean", "median", "fair_line", "n_games", "share", "flags", "played",
+    "breakeven", "edge", "w_lambda", "cal_p_more", "cal_p_less", "cal_p_push", "cal_edge",
+    "raw_side", "raw_p_more", "raw_p_less", "raw_p_push", "raw_edge", "k_spread", "mean", "median", "fair_line", "n_games", "share", "flags", "played",
 ]
 SLATE_GRADED_COLUMNS = ["row_id", "status", "actual", "series_id", "graded_at"]
 
@@ -65,11 +65,16 @@ def make_slate_rows(results: pd.DataFrame, slate_date: str, backfill: bool, cuto
             p_map=_r(r.get("p_map")), calibrated=int(bool(r.get("calibrated", False))),
             side=r["side"], p_more=_r(r["p_more"]), p_less=_r(r["p_less"]),
             p_push=_r(r["p_push"]), p_side=_r(r["p_side"]), breakeven=_r(r["breakeven"]),
-            edge=_r(r["edge"]), raw_side=r.get("raw_side", r["side"]),
+            edge=_r(r["edge"]), w_lambda=_r(r.get("w_lambda", 1.0)),
+            cal_p_more=_r(r.get("cal_p_more", r["p_more"])),
+            cal_p_less=_r(r.get("cal_p_less", r["p_less"])),
+            cal_p_push=_r(r.get("cal_p_push", r["p_push"])),
+            cal_edge=_r(r.get("cal_edge", r["edge"])), raw_side=r.get("raw_side", r["side"]),
             raw_p_more=_r(r.get("raw_p_more", r["p_more"])),
             raw_p_less=_r(r.get("raw_p_less", r["p_less"])),
             raw_p_push=_r(r.get("raw_p_push", r["p_push"])),
-            raw_edge=_r(r.get("raw_edge", r["edge"])), mean=_r(r["mean"], 3),
+            raw_edge=_r(r.get("raw_edge", r["edge"])), k_spread=_r(r.get("k_spread", 1.0)),
+            mean=_r(r["mean"], 3),
             median=float(r["median"]), fair_line=float(r["fair_line"]),
             n_games=int(r["n_games"]), share=_r(r.get("share")), flags=r.get("flags", ""),
             played=0,
@@ -136,8 +141,9 @@ def mark_played(store, row_ids, played: bool = True) -> pd.DataFrame:
 
 # ------------------------------------------------------------------ evaluation ----
 def evaluate(slates: pd.DataFrame, graded: pd.DataFrame) -> dict:
-    """Hit rate vs predicted for the model side (calibrated and raw), by side, by played,
-    and a calibration table of P(more) vs over at the logged lines."""
+    """Hit rate vs predicted for the model side (shown = W, calibrated = I, raw), by side,
+    played and backfill, and a calibration table of shown P(more) vs over. Rows logged
+    before W existed have no cal_* columns; their calibrated P is the shown P."""
     from src.backtest.metrics import calibration_table
     if slates.empty:
         return {"n": 0}
@@ -153,7 +159,11 @@ def evaluate(slates: pd.DataFrame, graded: pd.DataFrame) -> dict:
     done["over"] = (a > line).astype(int)
     done["under"] = (a < line).astype(int)
     rows = []
-    for label, side_col, pm, pl in (("calibrated", "side", "p_more", "p_less"),
+    for c in ("cal_p_more", "cal_p_less"):
+        base = done[c.replace("cal_", "")]
+        done[c] = done[c].fillna(base) if c in done else base
+    for label, side_col, pm, pl in (("shown", "side", "p_more", "p_less"),
+                                    ("calibrated", "side", "cal_p_more", "cal_p_less"),
                                     ("raw", "raw_side", "raw_p_more", "raw_p_less")):
         p = np.where(done[side_col] == "more", done[pm], done[pl]).astype(float)
         hit = np.where(done[side_col] == "more", done["over"], done["under"])
@@ -170,3 +180,26 @@ def evaluate(slates: pd.DataFrame, graded: pd.DataFrame) -> dict:
     out["calib"] = calibration_table(done["p_more"].astype(float), done["over"], 0.1)
     out["bias"] = float((done["mean"].astype(float) - a).mean())
     return out
+
+
+REAL_W_MIN_ROWS = 300
+
+
+def graded_real_rows(slates: pd.DataFrame, graded: pd.DataFrame,
+                     platform: str = "PrizePicks") -> pd.DataFrame:
+    """Graded (win / loss / push) slate-log rows on `platform`, as W fit rows: slate =
+    slate_id, date = slate_date, calibrated (pre-W) P(more / less / push), y = actual."""
+    if slates.empty or graded.empty:
+        return pd.DataFrame(columns=["slate", "date", "market", "line", "p_more", "p_less",
+                                     "p_push", "y"])
+    d = slates.merge(graded[["row_id", "status", "actual"]], on="row_id", how="inner")
+    d = d[(d["platform"] == platform) & d["status"].isin(["win", "loss", "push"])
+          & d["actual"].notna()]
+    out = pd.DataFrame({"slate": d["slate_id"].astype(str),
+                        "date": pd.to_datetime(d["slate_date"]),
+                        "market": d["market"], "line": d["line"].astype(float), "y":
+                        d["actual"].astype(float)})
+    for c in ("p_more", "p_less", "p_push"):
+        v = d[f"cal_{c}"].fillna(d[c]) if f"cal_{c}" in d else d[c]
+        out[c] = v.astype(float).to_numpy()
+    return out.reset_index(drop=True)

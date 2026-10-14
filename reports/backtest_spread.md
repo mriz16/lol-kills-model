@@ -2,6 +2,11 @@
 
 24,979 player-series, 2025-03-28 -> 2026-10-13. Base = live locked config **L+O** (shrink30 + A + B50 + O). Paired deltas vs L+O with standard errors.
 
+> **Update 2026-10-14 (signed off):** S locked and applied in the app; I-beta kept as a
+> display layer; K rejected. The top-edge overstatement below is now handled by W
+> (shrink toward the line, λ per market). The minimum edge was re-derived on W-adjusted
+> edges as 3 pts. See `reports/calibration_fit.md`, which the weekly refit rewrites.
+
 ## Recommendation
 
 | | CRPS vs L+O (se) | log vs L+O (se) | bias | ECE half-pt | tail obs/pred | PIT var ratio | top-5 shortfall |
