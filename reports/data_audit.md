@@ -4,10 +4,10 @@ Sources: 2025_LoL_esports_match_data_from_OraclesElixir.csv, 2026_LoL_esports_ma
 Raw rows: 236,292; raw games: 19,691  
 Date range: 2025-01-11 11:11:24 -> 2026-10-13 17:35:36  
 Patch range: 15.01 -> 16.2 (43 patches)  
-Kept (complete, in-scope): 5,700 games, 2,455 series, 57,000 player rows  
-Incomplete in-scope games dropped: 943  
-Series with a missing map (excluded from backtest): 19  
-Best-of inferred: {1: 569, 3: 1457, 5: 429}
+Kept (complete + passing partial, in-scope): 6,631 games, 2,804 series, 66,310 player rows  
+Incomplete in-scope games: 943 (kept as passing partial: 931)  
+Series with a missing map (excluded from backtest): 4  
+Best-of inferred: {1: 613, 3: 1683, 5: 508}
 
 ## Expected league codes
 
@@ -25,7 +25,7 @@ LTA N -> LCS, LTA North -> LCS
 
 | league | raw_games | incomplete_games | raw_rows | kept_games | kept_series | maps_to | in_scope |
 |---|---|---|---|---|---|---|---|
-| LPL | 1479 | 931 | 17748 | 548 | 213 |  | True |
+| LPL | 1479 | 931 | 17748 | 1479 | 562 |  | True |
 | LCK | 1057 | 0 | 12684 | 1057 | 397 |  | True |
 | LCKC | 1033 | 0 | 12396 | 1033 | 386 |  | True |
 | EM | 954 | 0 | 11448 | 954 | 466 |  | True |
@@ -82,4 +82,15 @@ LTA N -> LCS, LTA North -> LCS
 
 ## Warnings
 
-- LPL: 931/1479 games not 'complete' (dropped)
+- LPL: 931/1479 games not 'complete' (see partial games below)
+
+## Partial games (LPL)
+
+Kept only if kills/deaths/assists/result/gamelength and playername are non-null for all 10 players and player kills sum to team kills on both sides.
+
+| league | year | partial_games | passed | failed |
+|---|---|---|---|---|
+| LPL | 2025 | 805 | 805 | 0 |
+| LPL | 2026 | 126 | 126 | 0 |
+
+**LPL 2025 partial games: 805 pass, 0 fail.**
