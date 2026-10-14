@@ -103,10 +103,11 @@ tests/                      pytest (fixture in tests/fixtures/)
   (also printed to the log and the job summary) and commits it with the parquet.
 - Committed parquet is slim: only the columns in `PLAYER_KEEP` / `TEAM_KEEP` (`src/data/oe.py`).
 - `ci.yml`: pytest on Python 3.11 on every push / PR.
-- Upper-tail toggles on `EngineConfig`, **all off by default, none locked**:
+- Upper-tail toggles on `EngineConfig`, all off by default; **A and B50 are locked** (via
+  `locked_config()`), C rejected:
   - A `position_kappa`: concentration fitted per position (method of moments); shares
     drawn as independent Gamma(k_j*s_j, 1/k_j), normalized, so means stay at s_j.
-  - B `neff_floor` (15 / 25 tested): if Kish n_eff of a team's decay-weighted W or L pool
+  - B `neff_floor` (25 / 35 / 50 tested; 50 locked): if Kish n_eff of a team's decay-weighted W or L pool
     is below the floor, mix with the league W/L pool (international -> global pool) at the
     largest team weight that reaches the floor.
   - C `smooth_bootstrap`: each drawn team-kill value x becomes NB(mean x, r_league), r
@@ -117,12 +118,30 @@ tests/                      pytest (fixture in tests/fixtures/)
   is the best stand-alone B/C by CRPS (all three A+X combos run; the others are marked
   "not selected"). `--quick` scores only the latest 6 months; `--variants` picks a subset.
 
+## Bias toggles (tested on the locked config; `reports/backtest_bias.md`)
+- Variants `L+<toggles>` in `src/backtest/walkforward.py`, all off by default:
+  - M `meta_drift_patches` (1/2/3): pool values x (league kills/game over the latest N
+    patches, min 20 games) / (decay-weighted league kills/game) of each pool game's league.
+    REJECTED: worse CRPS for every N, bias unchanged.
+  - P `fit_priors`: position priors refit walk-forward per league (decay-weighted, blended
+    with the all-league fit by min(1, n/200)). NOT LOCKED: score-neutral, only moves bias
+    between positions.
+  - G `kill_mult`: reference only, never lock. Global multiplier = sum(actual)/sum(mean)
+    of the locked variant over series started >= 1 day before the cutoff (after 500 rows).
+  - O `opp_by_outcome`: outcome-conditional opponent adjustment (opponent kills allowed in
+    its losses when side s wins, vs the average winner; mirror for losses). Same fade and
+    clamp. RECOMMENDED TO LOCK (awaiting user sign-off: changes locked step c).
+- Run with `run_backtest.py --rows-only --tag ... --variants ...` (+ `--drop-partial 2025`),
+  then `scripts/bias_report.py`.
+
 ## Status
 - Phase 1 built; synthetic gate report in `reports/backtest_synthetic.md`.
-- Real-data backtest done: `reports/backtest_real.md` (OE 2025-2026, 22,073 player-series).
-  Recommended lock (awaiting user sign-off): shrink30 + A (position_kappa) + B50
-  (neff_floor=50); game-script OFF; C OFF. CRPS -0.0199 vs base (se 0.0018).
-- League codes: OE 2025 `LTA N` aliased to LCS (`LEAGUE_CODE_ALIASES`). LPL 2025 is
-  entirely non-`complete` in OE, so LPL history starts 2026.
-- Open: mean under-prediction ~0.13 kills/player-series (top/mid/bot), tails still ~10%
-  thin; higher B floors untested. UI not started.
+- Real-data backtest: `reports/backtest_real.md`. Locked shrink30 + A + B50 (2026-10-14).
+- Bias backtest: `reports/backtest_bias.md` (24,979 player-series incl. LPL 2025 partial).
+  The ~-0.13 under-prediction came from step (c) double-counting team strength (BO5 bias
+  -0.49). L+O: CRPS -0.0268 (se 0.0027), bias -0.129 -> -0.069. M rejected, P not locked.
+- League codes: OE 2025 `LTA N` aliased to LCS (`LEAGUE_CODE_ALIASES`). LPL partial games
+  kept under the kill-consistency rule (LPL 2025: 805 pass, 0 fail). This improves LPL 2026
+  CRPS by 0.021 (se 0.009).
+- Open: decide on locking O; residual bias -0.07 (top -0.15); tails ~6% thin; O
+  over-corrects at its extremes (softer fade untested). UI not started.
