@@ -27,12 +27,17 @@ def _naive_utc(ts) -> pd.Timestamp:
 
 
 def grade_picks(picks: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
-                now: datetime | None = None) -> pd.DataFrame:
-    """One graded row per pick: status in win/loss/push/void/pending, actual kills."""
+                now: datetime | None = None, id_col: str = "pick_id",
+                anchor_col: str = "logged_at") -> pd.DataFrame:
+    """One graded row per pick: status in win/loss/push/void/pending, actual kills.
+
+    The series is searched around `anchor_col` (the log time for picks, the slate date for
+    slate-log rows, so a backfilled slate grades against its own date)."""
     now = _naive_utc(now or datetime.now(timezone.utc))
     graded_at = now.isoformat(timespec="seconds")
+    columns = [id_col] + GRADED_COLUMNS[1:]
     if picks.empty:
-        return pd.DataFrame(columns=GRADED_COLUMNS)
+        return pd.DataFrame(columns=columns)
     t = teams[["gameid", "date", "teamname", "series_id", "map_no", "series_complete"]].copy()
     t["teamname"] = t["teamname"].astype(str)
     t["series_id"] = t["series_id"].astype(str)
@@ -46,11 +51,12 @@ def grade_picks(picks: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
         p[c] = p[c].astype(str)
 
     out = []
-    for r in picks.itertuples(index=False):
-        logged = _naive_utc(r.logged_at)
-        row = dict(pick_id=r.pick_id, status="pending", actual=np.nan, series_id="",
-                   graded_at=graded_at)
-        cand = first[(first["teamname"] == str(r.team)) & (first["opponent"] == str(r.opponent))
+    for r in picks.to_dict("records"):
+        logged = _naive_utc(r[anchor_col])
+        row = {id_col: r[id_col], "status": "pending", "actual": np.nan, "series_id": "",
+               "graded_at": graded_at}
+        cand = first[(first["teamname"] == str(r["team"]))
+                     & (first["opponent"] == str(r["opponent"]))
                      & (first["start"] >= logged - WINDOW_BEFORE)
                      & (first["start"] <= logged + WINDOW_AFTER)].sort_values("start")
         if cand.empty:
@@ -65,10 +71,10 @@ def grade_picks(picks: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
                 row["status"] = "void"
             out.append(row)
             continue
-        lo, hi = parse_market(str(r.market), 5)
+        lo, hi = parse_market(str(r["market"]), 5)
         played = list(range(lo, min(hi, int(s["maps"])) + 1))
-        mine = p[(p["series_id"] == s["series_id"]) & (p["playername"] == str(r.player))
-                 & (p["teamname"] == str(r.team))]
+        mine = p[(p["series_id"] == s["series_id"]) & (p["playername"] == str(r["player"]))
+                 & (p["teamname"] == str(r["team"]))]
         by_map = dict(zip(mine["map_no"].astype(int), mine["kills"].astype(int)))
         if not played or any(m not in by_map for m in played):
             row["status"] = "void"            # did not play every map in the range
@@ -76,25 +82,31 @@ def grade_picks(picks: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
             continue
         actual = int(sum(by_map[m] for m in played))
         row["actual"] = actual
-        line = float(r.line)
+        line = float(r["line"])
         if actual == line:
             row["status"] = "push"
-        elif (actual > line) == (str(r.side) == "more"):
+        elif (actual > line) == (str(r["side"]) == "more"):
             row["status"] = "win"
         else:
             row["status"] = "loss"
         out.append(row)
-    return pd.DataFrame(out, columns=GRADED_COLUMNS)
+    return pd.DataFrame(out, columns=columns)
 
 
-def merge_graded(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+def grade_slates(slates: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
+                 now: datetime | None = None) -> pd.DataFrame:
+    """Grade every slate-log row (status relative to the logged model side)."""
+    return grade_picks(slates, players, teams, now, id_col="row_id", anchor_col="slate_date")
+
+
+def merge_graded(old: pd.DataFrame, new: pd.DataFrame, id_col: str = "pick_id") -> pd.DataFrame:
     """Keep final grades (win/loss/push/void) from `old`; take everything else from new."""
     final = {"win", "loss", "push", "void"}
     if old is None or old.empty:
         return new.reset_index(drop=True)
     keep = old[old["status"].isin(final)]
-    rest = new[~new["pick_id"].isin(set(keep["pick_id"]))]
-    return pd.concat([keep, rest], ignore_index=True)[GRADED_COLUMNS]
+    rest = new[~new[id_col].astype(str).isin(set(keep[id_col].astype(str)))]
+    return pd.concat([keep, rest], ignore_index=True)[[id_col] + GRADED_COLUMNS[1:]]
 
 
 def settle_slips(picks: pd.DataFrame, graded: pd.DataFrame) -> pd.DataFrame:

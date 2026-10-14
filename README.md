@@ -9,7 +9,19 @@ The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off.
 - `src/engine/`: the simulator. `src/app/`: app logic (names, odds input, slate, OCR, pick
   log, grading).
 - `.github/workflows/refresh.yml`: runs daily. It refreshes `data/*.parquet` on `main`,
-  then grades logged picks on the `picks-log` branch.
+  then grades logged picks and the slate log on the `picks-log` branch.
+- The sims carry the locked spread inflation S. Probabilities shown in the app are
+  calibrated (I, beta) and then shrunk toward the line (W: `p_line + λ (p_cal − p_line)`,
+  λ per market). Calibrated-only and raw numbers are one tap away. A PLAY needs a shown
+  edge of at least 3 points. See `reports/backtest_spread.md` and
+  `reports/calibration_fit.md`.
+- `.github/workflows/calibrate.yml`: runs weekly (Mondays 11:07 UTC) and on demand. It
+  re-runs the walk-forward backtest and refits S / I / W (`scripts/refit_calibration.py`),
+  then commits `data/calib_pairs.parquet`, `data/spread_rows.parquet`,
+  `data/w_rows.parquet`, `data/calib_params.json` and `reports/calibration_fit.md`. If any
+  parameter moves more than the drift limits (S k ±0.10, I map ±0.05, W λ ±0.25), the job
+  fails and commits nothing. The report in the job summary shows what moved. To accept
+  the move, re-run with **force**.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -69,9 +81,36 @@ pick against the new OE data, and commits `logs/graded.csv`. It needs no extra s
 uses the workflow's own `GITHUB_TOKEN`. The Record tab also grades pending picks live from
 the app's data, so results show up as soon as the data has them.
 
+### Slate log and backfill
+Every **Run slate** writes every entered line (played or not) to `logs/slates.csv` on the
+same branch, with all model outputs (calibrated and raw) and a `played` flag. Logging a
+slip, or "Mark lines as played" on the Results tab, sets the flag. The workflow grades
+every row into `logs/slates_graded.csv`; the Record tab shows the result. This is the
+real-world evaluation set.
+
+To enter a past slate, open **Mode: live or backfill** at the top, turn on backfill and
+pick the slate date. Everything (pools, rosters, lineups, calibration) is then built from
+games before 00:00 UTC of that date only, and the rows are logged with `backfill = 1`.
+
+### Refitting W on real PrizePicks lines
+W's λ is fitted on stand-in lines (each player's rolling median + 0.5) until the slate log
+has real data. The Record tab shows how many graded PrizePicks lines exist, out of the 300
+needed. Once it reaches 300:
+
+```bash
+git fetch origin picks-log && git worktree add ../picks-log origin/picks-log
+python scripts/refit_w_real.py --log-root ../picks-log            # dry run: prints λ
+python scripts/refit_w_real.py --log-root ../picks-log --write    # data/w_lambda_real.json
+```
+
+Commit `data/w_lambda_real.json` to `main`. The app then uses the real-line λ for every
+cutoff after the last slate it was fitted on; backfills of earlier dates keep the
+proxy-line λ. The fit uses the same rule: the top 5 edges per logged slate should hit at
+their shown probability. Re-run it as the log grows.
+
 Grading rules:
 - A pick is matched to the first series of team vs opponent that starts between 1 day
-  before and 5 days after the time it was logged.
+  before and 5 days after the time it was logged (slate-log rows: after the slate date).
 - Kills count only on maps actually played in the market range.
 - A player who missed a map in the range → void.
 - A pick with no series found within 7 days → void.
@@ -95,4 +134,8 @@ Without secrets, the pick log is written to `logs/` on local disk (git-ignored).
 ```bash
 python scripts/refresh_data.py             # OE CSVs from Google Drive -> data/*.parquet
 python scripts/run_backtest.py --quick     # walk-forward backtest -> reports/
+python scripts/refit_calibration.py        # backtest + S/I/W refit -> data/calib_*, w_rows
+# spread / calibration study (report only)
+python scripts/run_backtest.py --rows-only --keep-pmf --tag spread --variants L+O
+python scripts/spread_report.py --rows reports/backtest_rows_spread_L+O.parquet
 ```

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -18,13 +19,13 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from src import config as C  # noqa: E402
-from src.app import grading, picklog  # noqa: E402
+from src.app import grading, picklog, slatelog  # noqa: E402
 from src.app.names import search_teams  # noqa: E402
 from src.app.ocr import ocr_image, parse_board_text, props_to_lines  # noqa: E402
-from src.app.slate import (MARKET_BY_FORMAT, PLATFORMS, THIN_EDGE, DataStore,  # noqa: E402
-                           MatchupInput,
-                           check_matchup, lineups_for, per_leg_breakeven, rebreakeven,
-                           results_table, run_matchup, slip_summary)
+from src.app.slate import (MARKET_BY_FORMAT, MIN_EDGE, PLATFORMS, THIN_EDGE,  # noqa: E402
+                           DataStore, MatchupInput, check_matchup, lineups_for,
+                           per_leg_breakeven, rebreakeven, results_table, run_matchup,
+                           side_balance, slip_summary)
 from src.engine.features import build_matchup  # noqa: E402
 from src.engine.sim import SeriesSim, simulate_series  # noqa: E402
 
@@ -38,8 +39,11 @@ LEAGUE_AUTO = "auto"
 
 # ============================================================== data (cached) ====
 def data_version() -> str:
-    files = [C.DATA_DIR / "players.parquet", C.DATA_DIR / "teams.parquet"]
-    return "-".join(str(int(f.stat().st_mtime)) + str(f.stat().st_size) for f in files)
+    files = [C.DATA_DIR / "players.parquet", C.DATA_DIR / "teams.parquet",
+             C.DATA_DIR / "calib_pairs.parquet", C.DATA_DIR / "spread_rows.parquet",
+             C.DATA_DIR / "w_rows.parquet", C.DATA_DIR / "w_lambda_real.json"]
+    return "-".join(str(int(f.stat().st_mtime)) + str(f.stat().st_size) for f in files
+                    if f.exists())
 
 
 @st.cache_data(show_spinner="Loading match data...")
@@ -48,16 +52,18 @@ def load_frames(version: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             pd.read_parquet(C.DATA_DIR / "teams.parquet"))
 
 
-@st.cache_resource(show_spinner="Building team pools...")
-def get_store(version: str) -> DataStore:
-    return DataStore(*load_frames(version))
+@st.cache_resource(show_spinner="Building team pools...", max_entries=4)
+def get_store(version: str, asof: str | None = None) -> DataStore:
+    """asof (YYYY-MM-DD): backfill store built from games before that date only."""
+    return DataStore(*load_frames(version), asof=asof)
 
 
 @st.cache_data(show_spinner=False, max_entries=128)
-def cached_sim(version: str, team_a: str, team_b: str, best_of: int, league: str,
-               p_map: float, lineup_a: tuple, lineup_b: tuple, n_sims: int, seed: int):
-    """Matchup pools + 20k-sim arrays, cached per (data version, matchup inputs)."""
-    store = get_store(version)
+def cached_sim(version: str, asof: str | None, team_a: str, team_b: str, best_of: int,
+               league: str, p_map: float, lineup_a: tuple, lineup_b: tuple, n_sims: int,
+               seed: int):
+    """Matchup pools + 20k-sim arrays, cached per (data version, asof, matchup inputs)."""
+    store = get_store(version, asof)
     params = build_matchup(store.hist, team_a, team_b, league, best_of, p_map,
                            (list(lineup_a), list(lineup_b)), store.cutoff, store.patch,
                            store.config())
@@ -69,7 +75,7 @@ def cached_sim(version: str, team_a: str, team_b: str, best_of: int, league: str
 
 def app_sim_fn(store, m, lines, odds, league, n_sims, seed):
     lu = lineups_for(store, m, lines)
-    return cached_sim(VERSION, m.team_a, m.team_b, int(m.best_of), league,
+    return cached_sim(VERSION, ASOF, m.team_a, m.team_b, int(m.best_of), league,
                       round(float(odds["p_map_a"]), 6), tuple(lu[0]), tuple(lu[1]),
                       n_sims, seed)
 
@@ -98,6 +104,38 @@ def load_log(nonce: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     return picklog.read_picks(store), picklog.read_graded(store)
 
 
+@st.cache_data(ttl=120, show_spinner="Reading slate log...")
+def load_slate_log(nonce: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    store, _ = get_log_store()
+    return slatelog.read_slates(store), slatelog.read_slates_graded(store)
+
+
+def log_slate(store: DataStore, df: pd.DataFrame):
+    """Every line of a run slate goes to the slate log (played or not)."""
+    meta = ss()["slate_meta"]
+    rows = slatelog.make_slate_rows(df, meta["slate_date"], store.backfill, store.cutoff,
+                                    slate_id=meta["slate_id"])
+    log_store, remote = get_log_store()
+    try:
+        slatelog.append_slate(log_store, rows)
+        ss()["log_nonce"] += 1
+        st.caption(f"Slate log: {len(rows)} line(s) saved for {meta['slate_date']}"
+                   + ("" if remote else " (local disk only: set GitHub secrets)."))
+    except Exception as exc:
+        st.error(f"Could not write the slate log: {exc}")
+
+
+def mark_played(row_ids: list[str]) -> bool:
+    log_store, _ = get_log_store()
+    try:
+        slatelog.mark_played(log_store, row_ids)
+        ss()["log_nonce"] += 1
+        return True
+    except Exception as exc:
+        st.error(f"Could not update the slate log: {exc}")
+        return False
+
+
 # ============================================================== slate state ====
 def ss():
     return st.session_state
@@ -110,6 +148,7 @@ def init_state():
     ss().setdefault("results", None)
     ss().setdefault("sims", {})
     ss().setdefault("log_nonce", 0)
+    ss().setdefault("slate_meta", None)
 
 
 def block_values(bid: int) -> dict:
@@ -279,10 +318,17 @@ def run_slate(store: DataStore):
     for s in skipped:
         st.error(f"Not run: {s}")
     if results:
-        ss()["results"] = results_table(results)
+        df = results_table(results)
+        slate_date = (store.asof or pd.Timestamp.now(tz="UTC").tz_localize(None)).date()
+        ss()["slate_meta"] = dict(slate_date=slate_date.isoformat(),
+                                  slate_id=slatelog.new_slate_id(), backfill=store.backfill)
+        df["row_id"] = [slatelog.row_key(slate_date.isoformat(), r)
+                        for r in df.to_dict("records")]
+        ss()["results"] = df
         ss()["sims"] = {r.inp.key: r.sim for r in results}
         st.success(f"Ran {len(results)} matchup(s), {len(ss()['results'])} props in "
                    f"{time.time() - tic:.1f}s. Open the Results tab.")
+        log_slate(store, df)
 
 
 # ============================================================== screenshot tab ====
@@ -336,7 +382,11 @@ def screenshot_tab(store: DataStore):
 
 # ============================================================== results tab ====
 FLAG_HELP = {
-    "THIN EDGE": f"edge under {100 * THIN_EDGE:.0f} points vs the per-leg breakeven",
+    "BELOW MIN": f"shown (W-adjusted) edge under the {100 * MIN_EDGE:.0f}-point minimum: "
+                 "after W the top edges per slate still carry ~1 point of noise (se); "
+                 f"{100 * MIN_EDGE:.0f} points clears it by 2 se",
+    "THIN EDGE": f"edge under {100 * THIN_EDGE:.0f} points vs the per-leg breakeven "
+                 "(uncalibrated: no minimum edge applied)",
     "LOW SAMPLE": "player has fewer than 20 games in the model window",
     "CAUTION": "'less' at a whole-number line with P(more) < 25%: in the backtest those "
                "overs hit about 9 points more often than predicted",
@@ -356,13 +406,35 @@ def results_tab():
     st.caption("Per-leg breakeven = (1/multiplier)^(1/legs): " + ", ".join(
         f"{p} {legs}L {PLATFORMS[p][legs]:g}x → {per_leg_breakeven(p, legs):.1%}"
         for p in plats))
+    calibrated = bool(df["calibrated"].all())
+    views = {"Shown": "", "Calibrated": "cal_", "Raw": "raw_"}
+    view_name = st.radio("Probabilities", list(views), horizontal=True, key="prob_view",
+                         disabled=not calibrated,
+                         help="Shown = calibrated (I) then shrunk toward the line (W); "
+                              "Calibrated = I only; Raw = the model's sims (with S).")
+    if not calibrated:
+        st.warning("No calibration data for this cutoff: raw model probabilities, and no "
+                   "PLAY marks (the minimum edge applies only after calibration).")
+    bal = side_balance(df)
+    if bal:
+        st.warning(f"Side balance: {bal['share']:.0%} of this slate's {bal['n']} plays are "
+                   f"{bal['side'].upper()}. One-sided slates were where the backtest's "
+                   "false edges clustered; check the lines before stacking them.")
+    pre = views[view_name] if calibrated else ""
     view = pd.DataFrame({
+        "play": np.where(df["play"], "✅", ""),
         "player": df["player"], "team": df["team"], "role": df["role"],
-        "line": df["line"], "pick": df["side"].str.upper(),
-        "edge": 100 * df["edge"], "P(more)": 100 * df["p_more"],
-        "P(less)": 100 * df["p_less"], "P(push)": 100 * df["p_push"],
+        "line": df["line"], "pick": df[f"{pre}side"].str.upper(),
+        "edge": 100 * df[f"{pre}edge"], "P(more)": 100 * df[f"{pre}p_more"],
+        "P(less)": 100 * df[f"{pre}p_less"], "P(push)": 100 * df[f"{pre}p_push"],
         "mean": df["mean"], "fair": df["fair_line"], "flags": df["flags"],
     })
+    st.caption({"": f"Shown probabilities (calibrated + W). ✅ = shown edge ≥ "
+                    f"{100 * MIN_EDGE:.0f} pts.",
+                "cal_": "Calibrated (I) probabilities, before W. ✅ / flags follow Shown.",
+                "raw_": "Raw model probabilities (sims with S, before I and W). ✅ / flags "
+                        "follow Shown."}[pre]
+               if calibrated else "Raw model probabilities.")
     pc = st.column_config.NumberColumn(format="%.1f%%")
     ev = st.dataframe(
         view, hide_index=True, width="stretch", on_select="rerun",
@@ -377,11 +449,23 @@ def results_tab():
         r = df.iloc[rows[0]]
         st.info(f"**{r.player} {r.side.upper()} {r.line:g}** ({r.market}, {r.matchup}): "
                 + r.why)
-        flags = [f for f in ("THIN EDGE", "LOW SAMPLE", "CAUTION") if f in str(r.flags)]
+        flags = [f for f in FLAG_HELP if f in str(r.flags)]
         for f in flags:
             st.caption(f"{f}: {FLAG_HELP[f]}")
     else:
-        st.caption("Tap a row to see why.")
+        st.caption("Tap a row to see why (raw and calibrated probabilities).")
+    mark_played_ui(df)
+
+
+def mark_played_ui(df: pd.DataFrame):
+    """Set the slate log's played flag for lines played outside a logged slip."""
+    with st.expander("Mark lines as played (slate log)"):
+        opts = {f"{r.player} {r.side.upper()} {r.line:g} ({r.matchup})": r.row_id
+                for r in df.itertuples()}
+        picked = st.multiselect("Played", list(opts), key="played_pick")
+        if st.button("Mark played", disabled=not picked) and mark_played(
+                [opts[k] for k in picked]):
+            st.success(f"Marked {len(picked)} line(s) played.")
 
 
 # ============================================================== slip tab ====
@@ -419,7 +503,15 @@ def slip_tab():
     c1.metric("Joint P", pct(s["p_joint"]))
     c2.metric("Payout", f"{s['payout']:g}x" if s["payout"] else "–")
     c3.metric("EV", f"{s['ev']:+.1%}" if s["ev"] is not None else "–")
-    note = f"Independent product {pct(s['p_independent'])}."
+    if s["p_joint_raw"] != s["p_joint"]:
+        with st.expander("Calibrated and raw slip"):
+            for lab, pk, ek in (("Calibrated (I, before W)", "p_joint_cal", "ev_cal"),
+                                ("Raw model", "p_joint_raw", "ev_raw")):
+                st.caption(f"{lab}: joint P {pct(s[pk])}"
+                           + (f", EV {s[ek]:+.1%}" if s[ek] is not None else ""))
+            st.caption("Shown / calibrated joint = raw shared-sim joint x each leg's shown "
+                       "/ calibrated over raw probability (capped at the weakest leg).")
+    note = f"Raw independent product {pct(s['p_independent'])}."
     if s["payout"]:
         note += f" Breakeven joint P {1 / s['payout']:.1%}."
     else:
@@ -427,6 +519,13 @@ def slip_tab():
     st.caption(note + " Same-matchup legs use shared sims.")
 
     _, remote = get_log_store()
+    if (ss().get("slate_meta") or {}).get("backfill"):
+        st.caption("Backfill slate: the pick log is for live slips. This marks the legs "
+                   "played in the slate log only.")
+        if st.button("Mark these legs played", type="primary") and mark_played(
+                [l["row_id"] for l in legs]):
+            st.success(f"Marked {len(legs)} leg(s) played in the slate log.")
+        return
     stake = st.number_input("Entry ($)", min_value=0.0, value=10.0, step=5.0)
     if st.button("Log this slip as played", type="primary", disabled=s["payout"] is None):
         rows = picklog.make_pick_rows(legs, s, platform, stake)
@@ -434,6 +533,7 @@ def slip_tab():
         try:
             picklog.append_picks(store, rows)
             ss()["log_nonce"] += 1
+            mark_played([l["row_id"] for l in legs])
             st.success(f"Logged slip {rows[0]['slip_id']} ({len(rows)} legs)"
                        + ("" if remote else " locally. Set GitHub secrets to keep it."))
         except Exception as exc:
@@ -448,11 +548,13 @@ def record_tab(store: DataStore):
                    "Streamlit Cloud wipes on restart. See README.")
     if st.button("Refresh"):
         ss()["log_nonce"] += 1
+    slate_log_section(store)
     try:
         picks, graded = load_log(ss()["log_nonce"])
     except Exception as exc:
         st.error(f"Could not read the log: {exc}")
         return
+    st.markdown("### Played slips")
     if picks.empty:
         st.info("No logged picks yet. Log a slip from the Slip tab.")
         return
@@ -481,13 +583,63 @@ def record_tab(store: DataStore):
     st.dataframe(s["slips"], hide_index=True, width="stretch")
 
 
+def slate_log_section(store: DataStore):
+    """Every logged line (played or not), graded: the real-world evaluation set."""
+    st.markdown("### Slate log (every entered line)")
+    try:
+        slates, sgraded = load_slate_log(ss()["log_nonce"])
+    except Exception as exc:
+        st.error(f"Could not read the slate log: {exc}")
+        return
+    if slates.empty:
+        st.info("No slates logged yet. Every Run slate is logged here.")
+        return
+    live = grading.grade_slates(slates, store.players, store.teams)
+    sgraded = grading.merge_graded(sgraded, live, id_col="row_id")
+    e = slatelog.evaluate(slates, sgraded)
+    st.caption(f"{e['n']} lines: {e.get('n_graded', 0)} graded, {e.get('n_pending', 0)} "
+               f"pending, {e.get('n_void', 0)} void. Hit rate of the model side vs its "
+               "predicted P: shown, calibrated and raw.")
+    if "table" in e:
+        t = e["table"].copy()
+        for c in ("pred", "hit", "diff"):
+            t[c] = 100 * t[c]
+        pc = st.column_config.NumberColumn(format="%.1f%%")
+        st.dataframe(t, hide_index=True, width="stretch",
+                     column_config={"pred": pc, "hit": pc, "diff": pc})
+        st.caption(f"Mean bias (model mean - actual): {e['bias']:+.2f} kills.")
+    n_real = len(slatelog.graded_real_rows(slates, sgraded))
+    need = slatelog.REAL_W_MIN_ROWS
+    st.progress(min(1.0, n_real / need),
+                text=f"Graded PrizePicks lines toward the real-line W refit: {n_real} / {need}"
+                + (" (ready: run scripts/refit_w_real.py)" if n_real >= need else ""))
+
+
 # ============================================================== main ====
 init_state()
 VERSION = data_version()
-store = get_store(VERSION)
 st.title("🎯 LoL Kills Props")
+with st.expander("Mode: live or backfill", expanded=False):
+    backfill = st.toggle("Backfill a past slate", key="backfill",
+                         help="Project a past slate from data before its date only.")
+    bf_date = st.date_input("Slate date", key="backfill_date",
+                            value=pd.Timestamp.now(tz="UTC").date() - timedelta(days=1),
+                            max_value=pd.Timestamp.now(tz="UTC").date(),
+                            disabled=not backfill)
+ASOF = pd.Timestamp(bf_date).date().isoformat() if backfill else None
+try:
+    store = get_store(VERSION, ASOF)
+except ValueError as exc:
+    st.error(f"Backfill: {exc}")
+    st.stop()
+cal_note = (f"S + I (beta) + W ({store.w_source})" if store.calibrated
+            else "uncalibrated") if store.spread_k else \
+    ("I (beta) + W, no S data" if store.calibrated else "uncalibrated, no S data")
+if store.backfill:
+    st.warning(f"BACKFILL {ASOF}: projections use only games before {ASOF} "
+               f"(last game in window {store.last_date:%Y-%m-%d}).")
 st.caption(f"OE data through {store.last_date:%Y-%m-%d} · patch {store.patch_name} · "
-           f"locked model (shrink30 + A + B50 + O), 20,000 sims")
+           f"locked model (shrink30 + A + B50 + O + S), 20,000 sims · {cal_note}")
 tabs = st.tabs(["Slate", "Screenshot (beta)", "Results", "Slip", "Record"])
 with tabs[0]:
     slate_tab(store)
@@ -498,4 +650,5 @@ with tabs[2]:
 with tabs[3]:
     slip_tab()
 with tabs[4]:
-    record_tab(store)
+    # grading needs every game, also in backfill mode
+    record_tab(get_store(VERSION) if store.backfill else store)

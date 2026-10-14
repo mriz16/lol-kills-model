@@ -122,6 +122,9 @@ def main(argv=None) -> int:
                     help="drop games flagged partial in these years (e.g. 2025)")
     ap.add_argument("--rows-only", action="store_true",
                     help="only write backtest_rows<tag>.parquet (for scripts/bias_report.py)")
+    ap.add_argument("--keep-pmf", action="store_true",
+                    help="store each row's predictive pmf (for scripts/spread_report.py)")
+    ap.add_argument("--since", help="score series from this date on (YYYY-MM-DD)")
     args = ap.parse_args(argv)
 
     players = pd.read_parquet(args.data / "players.parquet")
@@ -143,8 +146,11 @@ def main(argv=None) -> int:
     eval_start = None
     if args.quick:
         eval_start = pd.to_datetime(teams["date"]).max() - pd.DateOffset(months=6)
+    if args.since:
+        eval_start = pd.Timestamp(args.since)
     res = run_backtest(players, teams, variants=variants, n_sims=args.sims,
-                       warmup_days=args.warmup_days, eval_start=eval_start)
+                       warmup_days=args.warmup_days, eval_start=eval_start,
+                       keep_pmf=args.keep_pmf)
     if res.empty:
         print("error: no series scored", file=sys.stderr)
         return 1

@@ -1,0 +1,59 @@
+name: refit-calibration
+
+# Weekly (and manual) refit of the app's post-sim calibration: walk-forward backtest of the
+# live locked config with pmfs -> S (spread k) -> I (beta) -> W (lambda per market), then
+# commits data/calib_pairs.parquet, data/spread_rows.parquet, data/w_rows.parquet,
+# data/calib_params.json and reports/calibration_fit.md to main.
+# scripts/refit_calibration.py exits 1 (and writes nothing to data/) when the new fit
+# moved more than its drift limits vs the committed calib_params.json; the job then fails
+# and the report in the job summary says what moved. Re-run manually with force = true
+# to accept a big move after checking it.
+
+on:
+  schedule:
+    - cron: "7 11 * * 1"   # Mondays 11:07 UTC, after the daily data refresh (09:17)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Accept the new fit even if the drift check fails"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data       # same group as refresh.yml: never two data commits at once
+  cancel-in-progress: false
+
+jobs:
+  refit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Refit S / I / W (fails on a drift-check failure)
+        env:
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: python scripts/refit_calibration.py $FORCE
+      - name: Commit calibration data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/calib_pairs.parquet data/spread_rows.parquet data/w_rows.parquet \
+                  data/calib_params.json reports/calibration_fit.md
+          if git diff --cached --quiet; then echo "no calibration changes"; exit 0; fi
+          git commit -m "calibration: weekly S/I/W refit ($(date -u +%F))"
+          for i in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git fetch origin main && git rebase origin/main
+          done
+          exit 1

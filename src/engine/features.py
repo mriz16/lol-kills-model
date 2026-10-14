@@ -48,6 +48,11 @@ class EngineConfig:
     opp_by_outcome: bool = False
     # G) reference only: global multiplier on team kills (fit walk-forward by the runner)
     kill_mult: float = 1.0
+    # --- spread toggles (off by default; see reports/backtest_spread.md) ---
+    # K) per-player kill-share concentration (needs position_kappa): each player's
+    #    method-of-moments kappa from the player's own prior games, shrunk toward the position
+    #    kappa on the overdispersion scale rho = 1/(1+kappa) by n / (n + player_kappa_n0).
+    player_kappa_n0: float = 0.0       # 0 = off
 
 
 def locked_config(**overrides) -> EngineConfig:
@@ -346,6 +351,29 @@ def _mom_kappa(k, K, p) -> float:
     return float(np.sqrt(lo * hi))
 
 
+def player_kappa(hist: History, player: str, kappa_pos: float, cutoff: int, patch: int,
+                 cfg: EngineConfig) -> tuple[float, int]:
+    """Toggle K: (shrunk per-player concentration, n games). Method of moments on the
+    player's prior games in the patch lookback, shrunk toward the position kappa on the
+    rho = 1 / (1 + kappa) scale with weight n / (n + cfg.player_kappa_n0)."""
+    idx = hist.player_idx.get(player)
+    if idx is None:
+        return kappa_pos, 0
+    idx = hist._prior(idx, hist.p_time, cutoff)
+    keep, _ = hist._weights(hist.p_patch[idx], patch, cfg)
+    idx = idx[keep]
+    k, K = hist.p_kills[idx], hist.p_teamkills[idx]
+    n = len(idx)
+    if n < 5 or K.sum() <= 0:
+        return kappa_pos, n
+    p = np.full(n, k.sum() / K.sum())
+    rho_hat = 1.0 / (1.0 + _mom_kappa(k, K, p))
+    rho_pos = 1.0 / (1.0 + kappa_pos)
+    w = n / (n + cfg.player_kappa_n0)
+    rho = w * rho_hat + (1 - w) * rho_pos
+    return float(1.0 / rho - 1.0), n
+
+
 def fit_nb_dispersion(hist: History, cutoff: int, patch: int,
                       cfg: EngineConfig | None = None) -> dict:
     """Toggle C: per-league NB dispersion r of team kills around their (team, outcome) mean.
@@ -534,6 +562,10 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
         else:
             # independent Gamma(k_j * s_j, 1/k_j): mean s_j, var s_j / k_j, then normalize
             kv = np.array([kpos[p] for p in C.POSITIONS])
+            if cfg.player_kappa_n0 > 0:
+                for j, pl in enumerate(lineups[s]):
+                    kv[j], n_k = player_kappa(hist, pl, kv[j], cutoff, patch, cfg)
+                    info[f"kappa_{s}_{j}"] = (float(kv[j]), n_k)
             alpha[s] = kv * shares
             scale[s] = 1.0 / kv
 

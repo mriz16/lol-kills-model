@@ -70,6 +70,15 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
   Underdog (2L 3x, 3L 6x, 4L 10x, 5L 20x, 6L 40x).
 - Slip joint probability: same-matchup legs from shared sim arrays; cross-matchup legs
   multiplied.
+- **S, spread inflation (locked 2026-10-14)**, applied after the sim to each player's
+  market total: `mean + k (x - mean)` per sim (stochastic rounding, clip 0, fixed seed per
+  player slot and market so slips share the arrays). k per position x market =
+  sqrt(SSE / sum var) on prior backtest rows, shrunk to pooled (`SeriesSim.spread_k`,
+  `calibration.inflate_samples`). Steps a-f are unchanged.
+- **Display layers (not part of the distribution)**: I = beta calibration of P(over) per
+  position x market (on the S pmfs), then W = `p_line + lambda (p_cal - p_line)` with
+  p_line = (1 - P(push)) / 2, lambda per market fitted so the top-5 edges per slate are
+  calibrated. **K rejected.** Minimum shown (W) edge for a PLAY: **3 pts**.
 
 ### Backtest (`src/backtest/`)
 - Walk-forward: each historical series is projected using ONLY prior data.
@@ -98,9 +107,15 @@ src/config.py               leagues, priors, constants
 src/data/                   OE processing, series inference, team aliases, synthetic gen
 src/engine/                 odds, history/features, sim, props/slips
 src/backtest/               elo, metrics, walk-forward runner
-src/app/                    app logic: names, odds_input, slate, ocr, picklog, grading
+src/engine/calibration.py   post-sim S (spread inflation), I (P(over) map), W (line shrinkage)
+src/backtest/calib_pipeline.py  walk-forward S/I/W pipeline, proxy lines, drift check
+src/app/                    app logic: names, odds_input, slate, ocr, picklog, slatelog, grading
 streamlit_app.py            Streamlit app (Phase 2)
-scripts/grade_picks.py      grade logs/picks.csv on the picks-log branch (refresh workflow)
+scripts/grade_picks.py      grade logs/picks.csv + logs/slates.csv on picks-log (refresh workflow)
+scripts/spread_report.py    PIT / S / K / I / selection-bias study report
+scripts/refit_calibration.py  backtest + S/I/W refit -> data/calib_pairs, spread_rows, w_rows,
+                            calib_params.json + reports/calibration_fit.md (calibrate.yml)
+scripts/refit_w_real.py     refit W's lambda on graded real PrizePicks lines (>= 300 rows)
 packages.txt                apt packages for Streamlit Cloud (tesseract-ocr)
 tests/                      pytest (fixture in tests/fixtures/)
 ```
@@ -109,7 +124,7 @@ tests/                      pytest (fixture in tests/fixtures/)
 `src.engine.features.locked_config()` = shrink30 + A (per-position kappa) + B50 (n_eff
 floor 50) + O (outcome-conditional opp adj, fade nDef/10). Game-script off, C off, M off,
 P off. `locked_config() == ALL_VARIANTS["L+O"]` (`LIVE_LOCKED` in walkforward.py). The app
-uses only `locked_config()`.
+uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
 
 ## Phase 2 app (`streamlit_app.py`, logic in `src/app/`)
 - Tabs: Slate, Screenshot (beta), Results, Slip, Record. Mobile-first (centered layout).
@@ -123,10 +138,29 @@ uses only `locked_config()`.
 - Screenshot: pytesseract on 1 or 2 vertical strips; `ocr.parse_board_text` fills an
   editable box; "Use these lines" copies into a chosen matchup. Never auto-runs.
 - Results: one table sorted by edge = P(model side) - (1/mult)^(1/legs) for the matchup's
-  platform; slip size for the breakeven is selectable (2-6, default 2). Flags: THIN EDGE
-  (edge < 3 pts), LOW SAMPLE (< 20 games in window), CAUTION ("less" with P(more) < 25%
-  at a whole line). Tap a row -> one-line explanation.
-- Slip: joint P from shared sims within a matchup, multiplied across; payout; EV.
+  platform; slip size for the breakeven is selectable (2-6, default 2). Probabilities and
+  edges are **shown = W(I(model with S))** by default; "Calibrated" (I only) and "Raw"
+  (sims with S) on a selector and in the tap-a-row explanation. PLAY = shown edge >=
+  `MIN_EDGE` (3 pts, `reports/calibration_fit.md`; never without calibration). All S / I /
+  W fits are as of the store's cutoff (backfill-safe). Flags: BELOW MIN (edge < 3 pts), THIN
+  EDGE (uncalibrated only, < 3 pts), LOW SAMPLE (< 20 games in window), CAUTION ("less"
+  with P(more) < 25% at a whole line). Side-balance warning when > 70% of a slate's plays
+  (>= 3) are one side.
+- Slip: joint P from shared sims within a matchup, multiplied across; shown (and
+  calibrated) joint = raw joint x each leg's shown (calibrated) / raw P, capped at the
+  weakest leg; payout and EV from the shown joint, calibrated and raw on tap.
+- Slate log (`slatelog`): every Run slate logs every line (played or not) with all model
+  outputs to `logs/slates.csv` on `picks-log`; `played` flag set by logging a slip or
+  "Mark lines as played". Graded into `logs/slates_graded.csv` by the refresh workflow:
+  the primary real-world evaluation set (Record tab, with the graded PrizePicks count
+  toward 300 for `scripts/refit_w_real.py`; its `data/w_lambda_real.json` replaces the
+  proxy-line lambda for cutoffs after its last slate).
+- Weekly `calibrate.yml` (+ manual, `force` input) reruns `scripts/refit_calibration.py`
+  and commits the S / I / W data; fails without committing if S k moves > 0.10, the I
+  map > 0.05 or a W lambda > 0.25 vs `data/calib_params.json`.
+- Backfill mode: `DataStore(asof=date)` keeps only games before 00:00 UTC of the date
+  (pools, rosters, lineups, kappas, calibrator); rows logged with `backfill = 1`; slips
+  can only be marked played (no pick-log write).
 - Pick log: `picklog.GitHubStore` writes `logs/picks.csv` to branch `picks-log` via the
   contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
   `refresh.yml` grades into `logs/graded.csv` on that branch; Record tab merges those
@@ -173,6 +207,24 @@ uses only `locked_config()`.
 - Run with `run_backtest.py --rows-only --tag ... --variants ...` (+ `--drop-partial 2025`),
   then `scripts/bias_report.py`.
 
+## Spread / calibration (tested on L+O; `reports/backtest_spread.md`)
+- Backtest rows can carry each row's pmf (`run_backtest(keep_pmf=True)`, `--keep-pmf`);
+  `scripts/spread_report.py` scores post-hoc toggles walk-forward (weekly refit, fits on
+  series >= 1 day before), PIT histograms by position / market, and the selection check.
+  - S `calibration.inflate_*`: mean + k (x - mean) per sim, k per position x market =
+    sqrt(SSE / sum var), shrunk to pooled. CRPS -0.0012 (se 0.0003), PIT var 1.047 ->
+    0.997. **LOCKED 2026-10-14, in the app.**
+  - K `player_kappa_n0` (30 / 100): per-player share concentration. ±0.0002. Rejected.
+  - I `Calibrator` (iso / beta) at lines rounded median -2.5..+2.5, applied only inside
+    that window (`calibrate_pmf`). ECE half-pt 0.0093 -> 0.0045 (beta), Brier flat, log
+    score of the induced pmf worse -> display layer only. App uses beta on L+O+S.
+  - W (approved 2026-10-14): lambda per market (Map 1 0.89, Maps 1-2 0.93, Maps 1-3 0.87)
+    takes the walk-forward top-5 shortfall from -3.0 to -0.9 pts (se 0.9), top-1 -2.6 ->
+    +0.6, top-3 -2.5 -> -0.6; min edge re-derived on W edges = 3 pts.
+  - Selection check (proxy line = floor(rolling median of last 10 market totals) + 0.5,
+    top-N per UTC date): top edges overstated ~3-4 pts on both sides, even calibrated ->
+    fixed by W (above).
+
 ## Status
 - Phase 1 built; synthetic gate report in `reports/backtest_synthetic.md`.
 - Real-data backtest: `reports/backtest_real.md`. Locked shrink30 + A + B50 (2026-10-14).
@@ -184,5 +236,8 @@ uses only `locked_config()`.
   CRPS by 0.021 (se 0.009).
 - O locked 2026-10-14; softer fades rejected (`reports/backtest_ofade_quick.md`).
 - Phase 2 app built (see above); deploy steps in README.md.
-- Open: residual bias -0.07 (top -0.15); tails ~6% thin (CAUTION flag in the app covers
-  the worst bucket).
+- Spread study done (`reports/backtest_spread.md`): S locked and in the app, K rejected,
+  I-beta + W display layers, MIN_EDGE 3 pts, slate log + backfill + grading, weekly
+  calibration refit.
+- Open: refit W on real PrizePicks lines at 300 graded rows; residual bias -0.07
+  (top -0.15).
