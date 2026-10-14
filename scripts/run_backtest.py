@@ -51,6 +51,17 @@ def league_vs_base(res: pd.DataFrame, best: str) -> pd.DataFrame:
     return g.sort_values("n", ascending=False).reset_index()
 
 
+def drop_partial(players: pd.DataFrame, teams: pd.DataFrame, years) -> tuple:
+    """Remove games flagged `partial` whose date falls in `years`."""
+    if "partial" not in teams:
+        return players, teams
+    t = teams[teams["partial"].astype(bool) & pd.to_datetime(teams["date"]).dt.year.isin(years)]
+    bad = set(t["gameid"])
+    print(f"dropping {len(bad)} partial games from {sorted(years)}")
+    return (players[~players["gameid"].isin(bad)].reset_index(drop=True),
+            teams[~teams["gameid"].isin(bad)].reset_index(drop=True))
+
+
 def data_summary(players: pd.DataFrame, teams: pd.DataFrame) -> tuple[str, bool]:
     synthetic = teams["gameid"].astype(str).str.startswith("SYN").mean() > 0.5
     d = pd.to_datetime(teams["date"])
@@ -107,10 +118,16 @@ def main(argv=None) -> int:
                     help=f"default: {' '.join(VARIANTS)}; any of: {' '.join(ALL_VARIANTS)}")
     ap.add_argument("--out", type=Path, default=REPORTS_DIR)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--drop-partial", type=int, nargs="*", metavar="YEAR",
+                    help="drop games flagged partial in these years (e.g. 2025)")
+    ap.add_argument("--rows-only", action="store_true",
+                    help="only write backtest_rows<tag>.parquet (for scripts/bias_report.py)")
     args = ap.parse_args(argv)
 
     players = pd.read_parquet(args.data / "players.parquet")
     teams = pd.read_parquet(args.data / "teams.parquet")
+    if args.drop_partial:
+        players, teams = drop_partial(players, teams, args.drop_partial)
     data_line, synthetic = data_summary(players, teams)
     print(data_line)
     if synthetic and "real" in args.tag:
@@ -135,6 +152,10 @@ def main(argv=None) -> int:
     tag = f"_{args.tag}" if args.tag else ""
     if args.quick:
         tag += "_quick"
+    if args.rows_only:
+        args.out.mkdir(parents=True, exist_ok=True)
+        res.to_parquet(args.out / f"backtest_rows{tag}.parquet", index=False)
+        return 0
     title = f"Backtest ({args.data}, {args.sims} sims{', last 6 months' if args.quick else ''})"
     text, s = report(res, title, data_line)
     args.out.mkdir(parents=True, exist_ok=True)

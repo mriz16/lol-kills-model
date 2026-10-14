@@ -16,7 +16,12 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 
 ### Data
 - Source: OE yearly match CSV from Google Drive, downloaded with `gdown` by
-  `scripts/refresh_data.py`. Keep `datacompleteness == "complete"` only. Split player rows
+  `scripts/refresh_data.py`. Keep `datacompleteness == "complete"`, plus **LPL "partial"**
+  games (`PARTIAL_OK_LEAGUES`, signed off 2026-10-14) only if kills, deaths, assists, result
+  and gamelength are non-null for all 10 players (and playername, needed for lineups) AND
+  sum of player kills == team kills on each side (`src.data.oe.partial_check`). Team-level
+  kills/deaths/result/length of those games are filled from the player rows; parquet
+  carries a `partial` flag; the audit logs pass/fail counts per year. Split player rows
   (positions top/jng/mid/bot/sup) from team rows (`position == "team"`). Write compact
   parquet to `data/` (`players.parquet`, `teams.parquet`).
 - `.github/workflows/refresh.yml` runs the refresh daily and commits updated parquet.
@@ -27,6 +32,12 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 - Team-name alias table + fuzzy matcher (`src/data/teams.py`).
 - OE has no series id; series are inferred from consecutive games of the same team pair
   (new series when game number resets or > 1 day gap). Best-of inferred as 2*max_wins-1.
+
+### Locked engine config (user sign-off 2026-10-14)
+- **shrink30 + A + B50**: `EngineConfig(shrink_games=30, position_kappa=True,
+  neff_floor=50)` = backtest variant `shrink30+A+B50` (`LOCKED` in
+  `src/backtest/walkforward.py`). Game-script **OFF**, smooth bootstrap (C) **OFF**.
+  New toggles are tested on top of this config (variants named `L+...`).
 
 ### Engine (`src/engine/`)
 - Monte Carlo, **20,000 sims per series**, vectorized numpy.

@@ -46,6 +46,12 @@ SHRINK_GAMES = 20
 MIN_OUTCOME_POOL = 5
 GAME_SCRIPT_CLAMP = (0.85, 1.15)
 DEFAULT_KAPPA = 25.0
+# Toggle M (meta drift): min games in the "latest N patches" window (extended patch by
+# patch until reached) and clamp on the drift ratio.
+DRIFT_MIN_GAMES = 20
+DRIFT_CLAMP = (0.85, 1.20)
+# Toggle P (fitted priors): league games for full weight on the league's own fit.
+PRIOR_FULL_GAMES = 200
 
 # --- Payouts ------------------------------------------------------------------------
 PRIZEPICKS_POWER = {2: 3.0, 3: 5.0, 4: 10.0, 5: 20.0, 6: 40.0}
