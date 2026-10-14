@@ -58,9 +58,10 @@ jobs:
             git commit -m "data: refresh Oracle's Elixir parquet ($(date -u +%F))"
             git push
           fi
-      - name: Grade logged picks (picks-log branch)
-        # The app logs played picks to logs/picks.csv on the picks-log branch (GitHub API).
-        # Grade them against the fresh parquet and commit logs/graded.csv to that branch.
+      - name: Grade logged picks and the slate log (picks-log branch)
+        # The app logs played picks to logs/picks.csv and every entered line to
+        # logs/slates.csv on the picks-log branch (GitHub API). Grade both against the
+        # fresh parquet and commit logs/graded.csv + logs/slates_graded.csv to that branch.
         run: |
           if ! git ls-remote --exit-code --heads origin picks-log >/dev/null; then
             echo "no picks-log branch yet (nothing logged)"; exit 0
@@ -70,6 +71,7 @@ jobs:
           python scripts/grade_picks.py --log-root "$RUNNER_TEMP/picks-log"
           cd "$RUNNER_TEMP/picks-log"
           git add -f logs/graded.csv 2>/dev/null || true
+          git add -f logs/slates_graded.csv 2>/dev/null || true
           if git diff --cached --quiet; then echo "no grading changes"; exit 0; fi
           git commit -m "log: grade picks ($(date -u +%F))"
           for i in 1 2 3; do

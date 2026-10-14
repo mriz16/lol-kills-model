@@ -98,9 +98,11 @@ src/config.py               leagues, priors, constants
 src/data/                   OE processing, series inference, team aliases, synthetic gen
 src/engine/                 odds, history/features, sim, props/slips
 src/backtest/               elo, metrics, walk-forward runner
-src/app/                    app logic: names, odds_input, slate, ocr, picklog, grading
+src/engine/calibration.py   post-sim toggles S (spread inflation) and I (P(over) calibration)
+src/app/                    app logic: names, odds_input, slate, ocr, picklog, slatelog, grading
 streamlit_app.py            Streamlit app (Phase 2)
-scripts/grade_picks.py      grade logs/picks.csv on the picks-log branch (refresh workflow)
+scripts/grade_picks.py      grade logs/picks.csv + logs/slates.csv on picks-log (refresh workflow)
+scripts/spread_report.py    PIT / S / K / I / selection-bias report + data/calib_pairs.parquet
 packages.txt                apt packages for Streamlit Cloud (tesseract-ocr)
 tests/                      pytest (fixture in tests/fixtures/)
 ```
@@ -123,10 +125,22 @@ uses only `locked_config()`.
 - Screenshot: pytesseract on 1 or 2 vertical strips; `ocr.parse_board_text` fills an
   editable box; "Use these lines" copies into a chosen matchup. Never auto-runs.
 - Results: one table sorted by edge = P(model side) - (1/mult)^(1/legs) for the matchup's
-  platform; slip size for the breakeven is selectable (2-6, default 2). Flags: THIN EDGE
-  (edge < 3 pts), LOW SAMPLE (< 20 games in window), CAUTION ("less" with P(more) < 25%
-  at a whole line). Tap a row -> one-line explanation.
-- Slip: joint P from shared sims within a matchup, multiplied across; payout; EV.
+  platform; slip size for the breakeven is selectable (2-6, default 2). Probabilities and
+  edges are **calibrated (I, beta, model L+O pairs) by default**; raw on a toggle and in the
+  tap-a-row explanation. PLAY = calibrated edge >= `MIN_EDGE` (5 pts, from the selection
+  check; never without calibration). Flags: BELOW MIN (calibrated, edge < 5 pts), THIN
+  EDGE (uncalibrated only, < 3 pts), LOW SAMPLE (< 20 games in window), CAUTION ("less"
+  with P(more) < 25% at a whole line). Side-balance warning when > 70% of a slate's plays
+  (>= 3) are one side.
+- Slip: joint P from shared sims within a matchup, multiplied across; calibrated joint =
+  raw joint x each leg's calibrated / raw P (capped at the weakest leg); payout; EV.
+- Slate log (`slatelog`): every Run slate logs every line (played or not) with all model
+  outputs to `logs/slates.csv` on `picks-log`; `played` flag set by logging a slip or
+  "Mark lines as played". Graded into `logs/slates_graded.csv` by the refresh workflow:
+  the primary real-world evaluation set (Record tab).
+- Backfill mode: `DataStore(asof=date)` keeps only games before 00:00 UTC of the date
+  (pools, rosters, lineups, kappas, calibrator); rows logged with `backfill = 1`; slips
+  can only be marked played (no pick-log write).
 - Pick log: `picklog.GitHubStore` writes `logs/picks.csv` to branch `picks-log` via the
   contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
   `refresh.yml` grades into `logs/graded.csv` on that branch; Record tab merges those
@@ -173,6 +187,21 @@ uses only `locked_config()`.
 - Run with `run_backtest.py --rows-only --tag ... --variants ...` (+ `--drop-partial 2025`),
   then `scripts/bias_report.py`.
 
+## Spread / calibration (tested on L+O; `reports/backtest_spread.md`)
+- Backtest rows can carry each row's pmf (`run_backtest(keep_pmf=True)`, `--keep-pmf`);
+  `scripts/spread_report.py` scores post-hoc toggles walk-forward (weekly refit, fits on
+  series >= 1 day before), PIT histograms by position / market, and the selection check.
+  - S `calibration.inflate_*`: mean + k (x - mean) per sim, k per position x market =
+    sqrt(SSE / sum var), shrunk to pooled. CRPS -0.0012 (se 0.0003), PIT var 1.047 ->
+    0.997. **Recommended to lock, awaiting sign-off; not in the app.**
+  - K `player_kappa_n0` (30 / 100): per-player share concentration. ±0.0002. Rejected.
+  - I `Calibrator` (iso / beta) at lines rounded median -2.5..+2.5, applied only inside
+    that window (`calibrate_pmf`). ECE half-pt 0.0093 -> 0.0045 (beta), Brier flat, log
+    score of the induced pmf worse -> display layer only. App uses beta on L+O.
+  - Selection check (proxy line = floor(rolling median of last 10 market totals) + 0.5,
+    top-N per UTC date): top edges overstated ~3-4 pts on both sides, even calibrated ->
+    MIN_EDGE 5 pts.
+
 ## Status
 - Phase 1 built; synthetic gate report in `reports/backtest_synthetic.md`.
 - Real-data backtest: `reports/backtest_real.md`. Locked shrink30 + A + B50 (2026-10-14).
@@ -184,5 +213,7 @@ uses only `locked_config()`.
   CRPS by 0.021 (se 0.009).
 - O locked 2026-10-14; softer fades rejected (`reports/backtest_ofade_quick.md`).
 - Phase 2 app built (see above); deploy steps in README.md.
-- Open: residual bias -0.07 (top -0.15); tails ~6% thin (CAUTION flag in the app covers
-  the worst bucket).
+- Spread study done (`reports/backtest_spread.md`): S recommended (pending sign-off),
+  K rejected, I-beta in the app, MIN_EDGE 5 pts, slate log + backfill + grading built.
+- Open: S sign-off (then app: inflate samples + `CALIB_MODEL = "L+O+S"`); residual bias
+  -0.07 (top -0.15); selection overconfidence ~3 pts on top edges.

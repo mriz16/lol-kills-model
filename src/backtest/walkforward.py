@@ -54,6 +54,15 @@ ALL_VARIANTS["L+G"] = EngineConfig(**LOCKED_CFG)
 for _d in (15, 20):
     ALL_VARIANTS[f"L+O{_d}"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True,
                                             opp_full_games=_d)
+# Spread toggle K on the live locked config: per-player share concentration shrunk
+# toward the position kappa by n / (n + n0). S (spread inflation) and I (probability
+# calibration) are post-hoc on the stored pmfs (src/engine/calibration.py,
+# scripts/spread_report.py), so they need no variant here.
+LIVE_LOCKED_CFG = dict(**LOCKED_CFG, opp_by_outcome=True)
+for _n0 in (30, 100):
+    ALL_VARIANTS[f"L+O+K{_n0}"] = EngineConfig(**LIVE_LOCKED_CFG, player_kappa_n0=_n0)
+SPREAD_VARIANTS = [LIVE_LOCKED, "L+O+K30", "L+O+K100"]
+PMF_MAX = 64               # stored pmf support 0..PMF_MAX-1 (last bin = PMF_MAX-1 or more)
 G_VARIANTS = {"L+G"}
 G_MIN_ROWS = 500           # player-series before G departs from 1.0
 BIAS_VARIANTS = [LOCKED, "L+M1", "L+M2", "L+M3", "L+P", "L+M1+P", "L+M2+P", "L+M3+P",
@@ -140,7 +149,8 @@ def _range_actual(kills: list, market: str) -> int | None:
 def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | None = None,
                  warmup_days: int = 75, n_sims: int = 20_000, seed: int = 2024,
                  refit_days: int = 30, eval_start: pd.Timestamp | None = None,
-                 verbose: bool = True, score_filter=None) -> pd.DataFrame:
+                 verbose: bool = True, score_filter=None,
+                 keep_pmf: bool = False) -> pd.DataFrame:
     """Score every series after the warmup (and after eval_start, if given).
 
     Elo and history always run over the full period, so eval_start only limits which
@@ -148,6 +158,9 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
 
     G variants (G_VARIANTS) scale team kills by sum(actual)/sum(predicted mean) of the
     LOCKED variant over player-series that started at least one day before the cutoff.
+
+    keep_pmf stores each row's predictive pmf (0..PMF_MAX-1, float32) and variance, for the
+    post-hoc spread / calibration study (scripts/spread_report.py).
     """
     if G_VARIANTS & set(variants or {}) and LOCKED not in (variants or {}):
         raise ValueError(f"G variants need {LOCKED} in the run")
@@ -216,6 +229,13 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
                             p_map=p_map, script_mult=params.script_mult, kappa=kappa,
                             kill_mult=cfg.kill_mult,
                         )
+                        if keep_pmf:
+                            pmf = np.bincount(np.minimum(k, PMF_MAX - 1).astype(np.int64),
+                                              minlength=PMF_MAX) / len(k)
+                            rec["pmf"] = pmf.astype(np.float32)
+                            rec["var"] = float(k.var())
+                            rec["n_games"] = int(params.info.get(
+                                f"share_{side}_{lineup.index(pl)}", (0, 0))[1])
                         if vname == LOCKED:
                             ys.append(y)
                             ms.append(rec["mean"])

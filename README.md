@@ -9,7 +9,10 @@ The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off.
 - `src/engine/`: the simulator. `src/app/`: app logic (names, odds input, slate, OCR, pick
   log, grading).
 - `.github/workflows/refresh.yml`: runs daily. It refreshes `data/*.parquet` on `main`,
-  then grades logged picks on the `picks-log` branch.
+  then grades logged picks and the slate log on the `picks-log` branch.
+- Probabilities shown in the app are calibrated (beta calibration of P(over), fitted on
+  the walk-forward backtest in `data/calib_pairs.parquet`; `reports/backtest_spread.md`).
+  A PLAY needs a calibrated edge of at least 5 points.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -69,9 +72,20 @@ pick against the new OE data, and commits `logs/graded.csv`. It needs no extra s
 uses the workflow's own `GITHUB_TOKEN`. The Record tab also grades pending picks live from
 the app's data, so results show up as soon as the data has them.
 
+### Slate log and backfill
+Every **Run slate** writes every entered line (played or not) to `logs/slates.csv` on the
+same branch, with all model outputs (calibrated and raw) and a `played` flag. Logging a
+slip, or "Mark lines as played" on the Results tab, sets the flag. The workflow grades
+every row into `logs/slates_graded.csv`; the Record tab shows the result. This is the
+real-world evaluation set.
+
+To enter a past slate, open **Mode: live or backfill** at the top, turn on backfill and
+pick the slate date. Everything (pools, rosters, lineups, calibration) is then built from
+games before 00:00 UTC of that date only, and the rows are logged with `backfill = 1`.
+
 Grading rules:
 - A pick is matched to the first series of team vs opponent that starts between 1 day
-  before and 5 days after the time it was logged.
+  before and 5 days after the time it was logged (slate-log rows: after the slate date).
 - Kills count only on maps actually played in the market range.
 - A player who missed a map in the range → void.
 - A pick with no series found within 7 days → void.
@@ -95,4 +109,7 @@ Without secrets, the pick log is written to `logs/` on local disk (git-ignored).
 ```bash
 python scripts/refresh_data.py             # OE CSVs from Google Drive -> data/*.parquet
 python scripts/run_backtest.py --quick     # walk-forward backtest -> reports/
+# spread / calibration study; also rewrites data/calib_pairs.parquet (app calibration)
+python scripts/run_backtest.py --rows-only --keep-pmf --tag spread --variants L+O
+python scripts/spread_report.py --rows reports/backtest_rows_spread_L+O.parquet
 ```
