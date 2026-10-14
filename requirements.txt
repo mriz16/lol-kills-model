@@ -5,3 +5,7 @@ scipy>=1.11
 gdown>=5.1
 rapidfuzz>=3.5
 pytest>=8
+streamlit>=1.50
+requests>=2.31
+pytesseract>=0.3.10
+Pillow>=10

@@ -29,6 +29,36 @@ for _f in (15, 25, 35, 50):
     ALL_VARIANTS[f"shrink30+A+B{_f}"] = EngineConfig(**S30, position_kappa=True,
                                                      neff_floor=_f)
 
+# Reference config of the bias study (user sign-off 2026-10-14): shrink30 + A + B50.
+# The L+ variants below are built on it. The live locked config adds O on top:
+# locked_config() == ALL_VARIANTS[LIVE_LOCKED] (O locked 2026-10-14).
+LOCKED = "shrink30+A+B50"
+LIVE_LOCKED = "L+O"
+LOCKED_CFG = dict(**S30, position_kappa=True, neff_floor=50)
+# Mean-bias toggles on top of the locked config. G is reference only (never locked):
+# its kill_mult is refit walk-forward by run_backtest from the LOCKED variant's errors.
+for _n in (1, 2, 3):
+    ALL_VARIANTS[f"L+M{_n}"] = EngineConfig(**LOCKED_CFG, meta_drift_patches=_n)
+    ALL_VARIANTS[f"L+M{_n}+P"] = EngineConfig(**LOCKED_CFG, meta_drift_patches=_n,
+                                              fit_priors=True)
+ALL_VARIANTS["L+P"] = EngineConfig(**LOCKED_CFG, fit_priors=True)
+# O (outcome-conditional opponent adjustment) was added after the M/P runs showed the
+# bias sits in BO5s / strong-vs-strong matchups; tested alone and with P and M3.
+ALL_VARIANTS["L+O"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True)
+ALL_VARIANTS["L+O+P"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True, fit_priors=True)
+ALL_VARIANTS["L+O+M3"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True,
+                                      meta_drift_patches=3)
+ALL_VARIANTS["L+G"] = EngineConfig(**LOCKED_CFG)
+# Softer O fade: min(1, nDef/15) and min(1, nDef/20) instead of /10. Tested --quick
+# 2026-10-14 (reports/backtest_ofade_quick.md): both slightly worse; /10 kept.
+for _d in (15, 20):
+    ALL_VARIANTS[f"L+O{_d}"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True,
+                                            opp_full_games=_d)
+G_VARIANTS = {"L+G"}
+G_MIN_ROWS = 500           # player-series before G departs from 1.0
+BIAS_VARIANTS = [LOCKED, "L+M1", "L+M2", "L+M3", "L+P", "L+M1+P", "L+M2+P", "L+M3+P",
+                 "L+G", "L+O", "L+O+P", "L+O+M3"]
+
 # Default run (real-data backtest). A is run with every B floor; summarize() keeps the
 # one matching the best stand-alone B as "shrink30+A+best-B".
 DEFAULT_VARIANTS = ["base", "shrink30", "shrink30+B25", "shrink30+B35", "shrink30+B50",
@@ -110,12 +140,18 @@ def _range_actual(kills: list, market: str) -> int | None:
 def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | None = None,
                  warmup_days: int = 75, n_sims: int = 20_000, seed: int = 2024,
                  refit_days: int = 30, eval_start: pd.Timestamp | None = None,
-                 verbose: bool = True) -> pd.DataFrame:
+                 verbose: bool = True, score_filter=None) -> pd.DataFrame:
     """Score every series after the warmup (and after eval_start, if given).
 
     Elo and history always run over the full period, so eval_start only limits which
-    series are scored (used by --quick).
+    series are scored (used by --quick). score_filter(SeriesInfo) -> bool limits it too.
+
+    G variants (G_VARIANTS) scale team kills by sum(actual)/sum(predicted mean) of the
+    LOCKED variant over player-series that started at least one day before the cutoff.
     """
+    if G_VARIANTS & set(variants or {}) and LOCKED not in (variants or {}):
+        raise ValueError(f"G variants need {LOCKED} in the run")
+    g_hist: list = []          # (start, sum y, sum mean) of LOCKED per scored series
     variants = variants or VARIANTS
     hist = History(players, teams)
     series = build_series(players, teams)
@@ -130,7 +166,7 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
     tic = time.time()
     for i, s in enumerate(series):
         p_map = elo.p_map(s.team_a, s.team_b, s.league)
-        if s.start >= t0:
+        if s.start >= t0 and (score_filter is None or score_filter(s)):
             cutoff = int(s.start.value)
             if kappa is None or (s.start - kappa_at).days >= refit_days:
                 kappa, kappa_at = fit_kappa(hist, cutoff), s.start
@@ -146,8 +182,19 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
                         env = hist.env_table(cutoff, s.patch, VARIANTS["base"])
                         mu = POSITION_PRIORS[pos] * env.get(s.league, env["_global"]) * 0.97
                     naive[pl] = mu
+            g_mult = 1.0
+            if G_VARIANTS & set(variants):
+                lim = s.start - pd.Timedelta(days=1)
+                done = [(y, m) for st, y, m in g_hist if st <= lim]
+                n_rows = sum(len(x) for x in done)
+                if n_rows >= G_MIN_ROWS:
+                    g_mult = float(sum(sum(y) for y, _ in done)
+                                   / sum(sum(m) for _, m in done))
+            ys, ms = [], []
             for vname, vcfg in variants.items():
                 cfg = replace(vcfg, kappa=kappa, kappa_pos=kappa_pos, nb_r=nb_r)
+                if vname in G_VARIANTS:
+                    cfg = replace(cfg, kill_mult=g_mult)
                 params = build_matchup(hist, s.team_a, s.team_b, s.league, s.best_of, p_map,
                                        s.lineups, cutoff, s.patch, cfg)
                 sim = simulate_series(params, n_sims=n_sims, rng=seed_i)
@@ -167,7 +214,11 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
                             over=int(y > line), push=int(y == line),
                             crps=crps_discrete(k, y), logscore=log_score(k, y),
                             p_map=p_map, script_mult=params.script_mult, kappa=kappa,
+                            kill_mult=cfg.kill_mult,
                         )
+                        if vname == LOCKED:
+                            ys.append(y)
+                            ms.append(rec["mean"])
                         # half-point lines around the median for a wider calibration curve
                         for j, off in enumerate((-1.5, -0.5, 0.5, 1.5)):
                             hl = line + off
@@ -190,6 +241,8 @@ def run_backtest(players: pd.DataFrame, teams: pd.DataFrame, variants: dict | No
                                              best_of=s.best_of, market=market, player=pl,
                                              position=pos, y=y, mean=naive[pl] * nmaps,
                                              crps=c, logscore=lsc))
+            if ys:
+                g_hist.append((s.start, ys, ms))
             if verbose and (i % 200 == 0):
                 print(f"[{i}/{len(series)}] {s.start.date()} {time.time() - tic:.0f}s",
                       flush=True)

@@ -15,7 +15,17 @@ LEAGUES = DOMESTIC_LEAGUES + INTERNATIONAL_LEAGUES
 
 # OE league code -> canonical code used by the model. Applied in src.data.oe.filter_raw
 # before the league filter. Fill from reports/data_audit.md ("League codes found").
-LEAGUE_CODE_ALIASES: dict[str, str] = {}
+# 2025: the LCS was replaced by the LTA with a North conference ("LTA N"); OE files those
+# games as "LTA N" and the 2026 LCS as "LCS". Same teams and environment -> one code.
+# Not aliased (out of scope): "LTA S" (CBLOL/LLA successor) and "LTA" (cross-conference
+# N vs S games), "EWC" (Esports World Cup), "KeSPA Cup".
+LEAGUE_CODE_ALIASES: dict[str, str] = {"LTA N": "LCS", "LTA North": "LCS"}
+
+# Leagues whose datacompleteness == "partial" games are kept when the kill data checks out
+# (src.data.oe.partial_check): kills/deaths/assists/result/gamelength (and playername)
+# non-null for all 10 players and sum of player kills == team kills on both sides.
+# OE marks all of LPL 2025 "partial" (missing non-kill stats). User sign-off 2026-10-14.
+PARTIAL_OK_LEAGUES = ["LPL"]
 
 # Prior multiplier applied to the participants' home-league average when an international
 # event has little measured history. FST is structurally low-kill.
@@ -36,6 +46,12 @@ SHRINK_GAMES = 20
 MIN_OUTCOME_POOL = 5
 GAME_SCRIPT_CLAMP = (0.85, 1.15)
 DEFAULT_KAPPA = 25.0
+# Toggle M (meta drift): min games in the "latest N patches" window (extended patch by
+# patch until reached) and clamp on the drift ratio.
+DRIFT_MIN_GAMES = 20
+DRIFT_CLAMP = (0.85, 1.20)
+# Toggle P (fitted priors): league games for full weight on the league's own fit.
+PRIOR_FULL_GAMES = 200
 
 # --- Payouts ------------------------------------------------------------------------
 PRIZEPICKS_POWER = {2: 3.0, 3: 5.0, 4: 10.0, 5: 20.0, 6: 40.0}

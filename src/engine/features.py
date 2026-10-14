@@ -34,6 +34,31 @@ class EngineConfig:
     smooth_bootstrap: bool = False
     nb_r: dict | None = None           # league -> r; None -> fit on the fly when enabled
     position_priors: dict = field(default_factory=lambda: dict(C.POSITION_PRIORS))
+    # --- mean-bias toggles (off by default; see CLAUDE.md / reports/backtest_bias.md) ---
+    # M) meta drift: scale pool values by (league kills/game over the latest N patches) /
+    #    (decay-weighted league kills/game) of the league each pool game was played in
+    meta_drift_patches: int = 0        # 0 = off; N = 1, 2, 3 tested
+    # P) position priors refit walk-forward per league (replaces POSITION_PRIORS)
+    fit_priors: bool = False
+    # O) outcome-conditional opponent adjustment: when side s draws from its W (L) pool,
+    #    use the opponent's kills allowed in its LOSSES (WINS) relative to the average
+    #    normalized kills of winners (losers). Fixes the plain adjRatio double-counting
+    #    team strength that the W/L pools already carry. LOCKED (2026-10-14) via
+    #    locked_config(); the dataclass default stays False so old variants are unchanged.
+    opp_by_outcome: bool = False
+    # G) reference only: global multiplier on team kills (fit walk-forward by the runner)
+    kill_mult: float = 1.0
+
+
+def locked_config(**overrides) -> EngineConfig:
+    """The locked engine config (CLAUDE.md, signed off 2026-10-14): shrink30 + A + B50 +
+    O (outcome-conditional opponent adjustment, fade min(1, nDef/10)), game-script off,
+    C / M / P off. Use this for live projections (the app)."""
+    cfg = dict(shrink_games=30, position_kappa=True, neff_floor=50.0, opp_by_outcome=True,
+               game_script=False, smooth_bootstrap=False, meta_drift_patches=0,
+               fit_priors=False)
+    cfg.update(overrides)
+    return EngineConfig(**cfg)
 
 
 @dataclass
@@ -79,6 +104,8 @@ class History:
         self.p_kills = p["kills"].values.astype(float)
         self.p_teamkills = p["teamkills"].values.astype(float)
         self.p_pos = p["position"].astype(str).values
+        self.p_league = p["league"].astype(str).values
+        self.p_league_idx = _index(self.p_league)
         self.player_idx = _index(self.p_player)
         self.leagues = sorted(self.league_idx)
 
@@ -165,6 +192,73 @@ class History:
             return float(prior)
         wt = min(1.0, n / C.EVENT_ENV_FULL_WEIGHT_GAMES)
         return float(wt * m + (1 - wt) * prior)
+
+    def recent_patch_env(self, idx, n_patches, min_games=C.DRIFT_MIN_GAMES):
+        """Plain team kills/game over the latest n patches present in rows idx (extended
+        one patch at a time until min_games games). nan if idx is empty."""
+        if len(idx) == 0:
+            return np.nan
+        pts = self.t_patch[idx]
+        uniq = np.unique(pts)[::-1]
+        k = min(n_patches, len(uniq))
+        while True:
+            sel = pts >= uniq[k - 1]
+            if sel.sum() >= 2 * min_games or k == len(uniq):
+                return float(self.t_kills[idx[sel]].mean())
+            k += 1
+
+    def drift_table(self, cutoff, patch, cfg, envs) -> dict:
+        """Toggle M: league -> recent-N-patch kills/game / decay-weighted kills/game.
+
+        Leagues whose env fell back to the global env, and international events, use the
+        global ratio. Clamped to DRIFT_CLAMP."""
+        n = cfg.meta_drift_patches
+        g_idx, _ = self.recent_rows(cutoff, patch, cfg)
+        g_rec = self.recent_patch_env(g_idx, n)
+        glob = g_rec / envs["_global"] if np.isfinite(g_rec) else 1.0
+        out = {"_global": float(np.clip(glob, *C.DRIFT_CLAMP))}
+        for lg in self.leagues:
+            idx = self.league_idx[lg]
+            idx = self._prior(idx, self.t_time, cutoff)
+            idx = idx[self.t_patch[idx] <= patch]
+            if lg in C.INTERNATIONAL_LEAGUES or len(idx) < 2 * C.DRIFT_MIN_GAMES:
+                out[lg] = out["_global"]
+                continue
+            m, n_games = self.measured_env(lg, cutoff, patch, cfg)
+            if n_games < 10 or not np.isfinite(m):
+                out[lg] = out["_global"]
+                continue
+            out[lg] = float(np.clip(self.recent_patch_env(idx, n) / m, *C.DRIFT_CLAMP))
+        return out
+
+    def fitted_priors(self, league, cutoff, patch, cfg) -> dict:
+        """Toggle P: position kill-share priors from prior data in `league` (decay-
+        weighted, patch lookback), blended with the all-league fit by min(1, n/PRIOR_FULL).
+        International events use the all-league fit."""
+        end = np.searchsorted(self.p_time, cutoff, side="left")
+        all_idx = np.arange(max(0, end - 60000), end)
+
+        def fit(idx):
+            keep, w = self._weights(self.p_patch[idx], patch, cfg)
+            idx, w = idx[keep], w[keep]
+            out, n = {}, len(idx) // 10
+            for pos in C.POSITIONS:
+                m = self.p_pos[idx] == pos
+                den = np.sum(w[m] * self.p_teamkills[idx[m]])
+                out[pos] = float(np.sum(w[m] * self.p_kills[idx[m]]) / den) if den > 0 \
+                    else C.POSITION_PRIORS[pos]
+            tot = sum(out.values())
+            return {k: v / tot for k, v in out.items()}, n
+
+        glob, n_glob = fit(all_idx)
+        if n_glob < 50:
+            glob = dict(C.POSITION_PRIORS)
+        lg_idx = self.p_league_idx.get(league)
+        if lg_idx is None or league in C.INTERNATIONAL_LEAGUES:
+            return glob
+        loc, n = fit(self._prior(lg_idx, self.p_time, cutoff))
+        wt = min(1.0, n / C.PRIOR_FULL_GAMES)
+        return {k: wt * loc[k] + (1 - wt) * glob[k] for k in C.POSITIONS}
 
     # ------------------------------------------------------------------ players ------
     def player_share(self, player, cutoff, patch, cfg):
@@ -333,14 +427,24 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
         else int(cutoff)
     envs = hist.env_table(cutoff, patch, cfg)
     target = hist.target_env(league, team_a, team_b, cutoff, patch, cfg, envs)
-    env_of = np.vectorize(lambda lg: envs.get(lg, envs["_global"]), otypes=[float])
+    if cfg.meta_drift_patches > 0:
+        drift = hist.drift_table(cutoff, patch, cfg, envs)
+        # dividing by env/drift == normalize by origin env, then apply origin drift
+        env_of = np.vectorize(lambda lg: envs.get(lg, envs["_global"])
+                              / drift.get(lg, drift["_global"]), otypes=[float])
+        env_raw = np.vectorize(lambda lg: envs.get(lg, envs["_global"]), otypes=[float])
+    else:
+        drift = None
+        env_of = env_raw = np.vectorize(lambda lg: envs.get(lg, envs["_global"]),
+                                        otypes=[float])
 
     teams = (team_a, team_b)
     rows = [hist.team_rows(t, cutoff, patch, cfg) for t in teams]
     g_idx, g_w = hist.recent_rows(cutoff, patch, cfg)
     g_norm = hist.t_kills[g_idx] / env_of(hist.t_league[g_idx]) if len(g_idx) else g_idx
+    g_raw = hist.t_kills[g_idx] / env_raw(hist.t_league[g_idx]) if len(g_idx) else g_idx
 
-    info = {"target_env": target, "envs": envs}
+    info = {"target_env": target, "envs": envs, "drift": drift}
     if cfg.neff_floor > 0:
         lg_rows = hist.league_idx.get(league)
         if lg_rows is None or league in C.INTERNATIONAL_LEAGUES:
@@ -356,19 +460,24 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
         # (c) opponent adjustment: opponent kills-allowed relative to its leagues' averages
         o_idx, o_w = rows[o]
         if len(o_idx):
-            allowed = hist.t_deaths[o_idx] / env_of(hist.t_league[o_idx])
+            allowed = hist.t_deaths[o_idx] / env_raw(hist.t_league[o_idx])
             raw = float(np.average(allowed, weights=o_w))
         else:
             raw = 1.0
         fade = min(1.0, len(o_idx) / cfg.opp_full_games)
         adj = float(np.clip(1.0 + (raw - 1.0) * fade, *cfg.opp_clamp))
         info[f"opp_adj_{s}"] = adj
+        adj_by = {0: adj, 1: adj}
+        if cfg.opp_by_outcome:
+            adj_by = _opp_adj_by_outcome(hist, o_idx, o_w, g_idx, g_w, g_raw, env_raw, cfg)
+            info[f"opp_adj_{s}_by_outcome"] = adj_by
 
         # (b)+(d) W/L pools, normalized by origin-league env, rescaled to target env
         idx, w = rows[s]
         norm = hist.t_kills[idx] / env_of(hist.t_league[idx]) if len(idx) else np.empty(0)
         side_pools = [None, None]
         for outcome in (0, 1):
+            adj = adj_by[outcome]
             sel = hist.t_result[idx] == outcome
             vals, wts = norm[sel], w[sel]
             n = int(sel.sum())
@@ -377,7 +486,7 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
                 vals, probs, lam = _blend_to_floor(vals, wts, l_norm[lsel], l_w[lsel],
                                                    cfg.neff_floor)
                 info[f"neff_lam_{s}_{outcome}"] = lam
-                side_pools[outcome] = (vals * target * adj, probs)
+                side_pools[outcome] = (vals * target * adj * cfg.kill_mult, probs)
                 info[f"n_pool_{s}_{outcome}"] = n
                 continue
             if n < cfg.min_outcome_pool:
@@ -391,14 +500,14 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
             if len(vals) == 0:  # no history at all: neutral environment
                 vals, wts = np.array([1.3 if outcome else 0.7]), np.array([1.0])
             probs = wts / wts.sum()
-            side_pools[outcome] = (vals * target * adj, probs)
+            side_pools[outcome] = (vals * target * adj * cfg.kill_mult, probs)
             info[f"n_pool_{s}_{outcome}"] = n
         pools.append(side_pools)
 
     # (e) game-script multiplier
     script = 1.0
     if cfg.game_script:
-        script = _game_script(hist, rows, league, envs, env_of, cutoff, patch, cfg)
+        script = _game_script(hist, rows, league, envs, env_raw, cutoff, patch, cfg)
     info["script_mult_raw"] = script
 
     # (f) player shares from overall pools, shrunk toward position priors
@@ -407,10 +516,13 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
     kpos = None
     if cfg.position_kappa:
         kpos = cfg.kappa_pos or fit_kappa_by_position(hist, cutoff)
+    priors = hist.fitted_priors(league, cutoff, patch, cfg) if cfg.fit_priors \
+        else cfg.position_priors
+    info["position_priors"] = priors
     for s in (0, 1):
         shares = np.zeros(5)
         for j, (pos, pl) in enumerate(zip(C.POSITIONS, lineups[s])):
-            prior = cfg.position_priors[pos]
+            prior = priors[pos]
             obs, n = hist.player_share(pl, cutoff, patch, cfg)
             wt = min(1.0, n / cfg.shrink_games) if cfg.shrink_games > 0 else 1.0
             shares[j] = prior if np.isnan(obs) else wt * obs + (1 - wt) * prior
@@ -434,6 +546,26 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
     return MatchupParams(teams=teams, best_of=best_of, p_map=float(p_map), pools=pools,
                          alpha=alpha, players=[list(lineups[0]), list(lineups[1])],
                          script_mult=script, info=info, scale=scale, nb_r=nb_r)
+
+
+def _opp_adj_by_outcome(hist, o_idx, o_w, g_idx, g_w, g_raw, env_raw, cfg) -> dict:
+    """Toggle O: {outcome of side s: adj}. Side s winning = opponent losing, so the
+    opponent's kills allowed in its losses are compared with the average normalized kills
+    of winning teams (and vice versa). Faded by min(1, n/opp_full_games), clamped."""
+    out = {}
+    for outcome in (0, 1):
+        ref_sel = hist.t_result[g_idx] == outcome
+        ref = float(np.average(g_raw[ref_sel], weights=g_w[ref_sel])) \
+            if ref_sel.any() else 1.0
+        sel = hist.t_result[o_idx] == 1 - outcome
+        if sel.any() and ref > 0:
+            allowed = hist.t_deaths[o_idx[sel]] / env_raw(hist.t_league[o_idx[sel]])
+            raw = float(np.average(allowed, weights=o_w[sel])) / ref
+        else:
+            raw = 1.0
+        fade = min(1.0, int(sel.sum()) / cfg.opp_full_games)
+        out[outcome] = float(np.clip(1.0 + (raw - 1.0) * fade, *cfg.opp_clamp))
+    return out
 
 
 def _game_script(hist, rows, league, envs, env_of, cutoff, patch, cfg) -> float:
