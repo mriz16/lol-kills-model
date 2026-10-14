@@ -43,17 +43,20 @@ class EngineConfig:
     # O) outcome-conditional opponent adjustment: when side s draws from its W (L) pool,
     #    use the opponent's kills allowed in its LOSSES (WINS) relative to the average
     #    normalized kills of winners (losers). Fixes the plain adjRatio double-counting
-    #    team strength that the W/L pools already carry. Not part of the locked spec (c).
+    #    team strength that the W/L pools already carry. LOCKED (2026-10-14) via
+    #    locked_config(); the dataclass default stays False so old variants are unchanged.
     opp_by_outcome: bool = False
     # G) reference only: global multiplier on team kills (fit walk-forward by the runner)
     kill_mult: float = 1.0
 
 
 def locked_config(**overrides) -> EngineConfig:
-    """The locked engine config (CLAUDE.md, signed off 2026-10-14): shrink30 + A + B50,
-    game-script off, smooth bootstrap off. Use this for live projections."""
-    cfg = dict(shrink_games=30, position_kappa=True, neff_floor=50.0, game_script=False,
-               smooth_bootstrap=False)
+    """The locked engine config (CLAUDE.md, signed off 2026-10-14): shrink30 + A + B50 +
+    O (outcome-conditional opponent adjustment, fade min(1, nDef/10)), game-script off,
+    C / M / P off. Use this for live projections (the app)."""
+    cfg = dict(shrink_games=30, position_kappa=True, neff_floor=50.0, opp_by_outcome=True,
+               game_script=False, smooth_bootstrap=False, meta_drift_patches=0,
+               fit_priors=False)
     cfg.update(overrides)
     return EngineConfig(**cfg)
 

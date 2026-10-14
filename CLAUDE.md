@@ -8,9 +8,9 @@ Stack: Python 3.11+, pandas, numpy (vectorized), pyarrow parquet. Streamlit UI c
 Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 
 ## Phases
-1. **Phase 1 (current)**: data + engine + backtest. Gate: report backtest table, calibration
-   buckets, winning variant and data issues. **Do not build the UI until the gate is passed.**
-2. Phase 2: Streamlit UI on top of `src.engine`.
+1. Phase 1: data + engine + backtest. Gate passed (real-data backtest, locked config).
+2. **Phase 2 (current)**: Streamlit app on top of `src.engine` (`streamlit_app.py`,
+   `src/app/`), deployed from `main` to Streamlit Community Cloud, Python 3.11.
 
 ## Locked decisions (do not change without the user's sign-off)
 
@@ -45,8 +45,13 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
   a) Draw map winner from `p_map` (input).
   b) Team kills: weighted bootstrap from that team's **WIN or LOSS pool** (by drawn
      outcome). Patch decay weight **0.65 per patch back**. **No extra recency weighting.**
-  c) Opponent adjustment: `adjRatio = opp kills-allowed / league avg`, faded by
-     `min(1, nDef/10)`, clamped **[0.80, 1.20]**.
+  c) Opponent adjustment, **outcome-conditional (O, locked 2026-10-14)**: when side s
+     draws a WIN, `adj = (opp kills allowed in its LOSSES) / (avg kills of winning teams)`;
+     on a LOSS, `(opp kills allowed in its WINS) / (avg kills of losing teams)` (both
+     env-normalized). Faded by `min(1, nDef/10)` with nDef = opponent games of that result,
+     clamped **[0.80, 1.20]**. (Replaced the plain `opp kills-allowed / league avg`, which
+     double-counted team strength.) Softer fades /15, /20 tested and rejected
+     (`reports/backtest_ofade_quick.md`).
   d) Cross-league scaling from measured team-kill averages per league. International
      events use scaled environments; FST is structurally low-kill.
   e) Game-script multiplier (combined KPM x projected game length vs league baseline) is a
@@ -93,8 +98,41 @@ src/config.py               leagues, priors, constants
 src/data/                   OE processing, series inference, team aliases, synthetic gen
 src/engine/                 odds, history/features, sim, props/slips
 src/backtest/               elo, metrics, walk-forward runner
+src/app/                    app logic: names, odds_input, slate, ocr, picklog, grading
+streamlit_app.py            Streamlit app (Phase 2)
+scripts/grade_picks.py      grade logs/picks.csv on the picks-log branch (refresh workflow)
+packages.txt                apt packages for Streamlit Cloud (tesseract-ocr)
 tests/                      pytest (fixture in tests/fixtures/)
 ```
+
+## Locked config
+`src.engine.features.locked_config()` = shrink30 + A (per-position kappa) + B50 (n_eff
+floor 50) + O (outcome-conditional opp adj, fade nDef/10). Game-script off, C off, M off,
+P off. `locked_config() == ALL_VARIANTS["L+O"]` (`LIVE_LOCKED` in walkforward.py). The app
+uses only `locked_config()`.
+
+## Phase 2 app (`streamlit_app.py`, logic in `src/app/`)
+- Tabs: Slate, Screenshot (beta), Results, Slip, Record. Mobile-first (centered layout).
+- Slate block: team search (alias table + fuzzy, `names.search_teams`), BO1/3/5,
+  platform, league (auto: shared home league, else latest international event, else WLDs),
+  series ML both teams + optional Map 1 ML (`odds_input`), lines box "player line".
+  Names are fuzzy-matched to the two teams' rosters (players seen in the team's last 60
+  days); team/role auto-filled; unmatched/ambiguous/bad lines block that matchup from
+  running. Market from format: BO1 Map 1, BO3 Maps 1-2, BO5 Maps 1-3. Lineup = latest
+  starters with matched line players swapped into their role.
+- Screenshot: pytesseract on 1 or 2 vertical strips; `ocr.parse_board_text` fills an
+  editable box; "Use these lines" copies into a chosen matchup. Never auto-runs.
+- Results: one table sorted by edge = P(model side) - (1/mult)^(1/legs) for the matchup's
+  platform; slip size for the breakeven is selectable (2-6, default 2). Flags: THIN EDGE
+  (edge < 3 pts), LOW SAMPLE (< 20 games in window), CAUTION ("less" with P(more) < 25%
+  at a whole line). Tap a row -> one-line explanation.
+- Slip: joint P from shared sims within a matchup, multiplied across; payout; EV.
+- Pick log: `picklog.GitHubStore` writes `logs/picks.csv` to branch `picks-log` via the
+  contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
+  `refresh.yml` grades into `logs/graded.csv` on that branch; Record tab merges those
+  final grades with live grading (record, ROI, calibration of logged picks).
+- Caching: parquet via `st.cache_data`, `DataStore` via `st.cache_resource`, matchup
+  pools + sims via `st.cache_data` keyed on the inputs. 5 matchups run in ~1 s.
 
 ## Phase 1.5 additions
 - `refresh.yml`: manual dispatch (optional `years` input), `OE_DRIVE_FOLDER_ID` from repo
@@ -104,7 +142,7 @@ tests/                      pytest (fixture in tests/fixtures/)
 - Committed parquet is slim: only the columns in `PLAYER_KEEP` / `TEAM_KEEP` (`src/data/oe.py`).
 - `ci.yml`: pytest on Python 3.11 on every push / PR.
 - Upper-tail toggles on `EngineConfig`, all off by default; **A and B50 are locked** (via
-  `locked_config()`), C rejected:
+  `locked_config()`, together with O), C rejected:
   - A `position_kappa`: concentration fitted per position (method of moments); shares
     drawn as independent Gamma(k_j*s_j, 1/k_j), normalized, so means stay at s_j.
   - B `neff_floor` (25 / 35 / 50 tested; 50 locked): if Kish n_eff of a team's decay-weighted W or L pool
@@ -130,7 +168,8 @@ tests/                      pytest (fixture in tests/fixtures/)
     of the locked variant over series started >= 1 day before the cutoff (after 500 rows).
   - O `opp_by_outcome`: outcome-conditional opponent adjustment (opponent kills allowed in
     its losses when side s wins, vs the average winner; mirror for losses). Same fade and
-    clamp. RECOMMENDED TO LOCK (awaiting user sign-off: changes locked step c).
+    clamp. **LOCKED** (user sign-off 2026-10-14). Softer fade (nDef/15, nDef/20) tested
+    --quick: +0.0006 (se 0.0004) / +0.0008 (se 0.0007) CRPS vs O -> not locked.
 - Run with `run_backtest.py --rows-only --tag ... --variants ...` (+ `--drop-partial 2025`),
   then `scripts/bias_report.py`.
 
@@ -143,5 +182,7 @@ tests/                      pytest (fixture in tests/fixtures/)
 - League codes: OE 2025 `LTA N` aliased to LCS (`LEAGUE_CODE_ALIASES`). LPL partial games
   kept under the kill-consistency rule (LPL 2025: 805 pass, 0 fail). This improves LPL 2026
   CRPS by 0.021 (se 0.009).
-- Open: decide on locking O; residual bias -0.07 (top -0.15); tails ~6% thin; O
-  over-corrects at its extremes (softer fade untested). UI not started.
+- O locked 2026-10-14; softer fades rejected (`reports/backtest_ofade_quick.md`).
+- Phase 2 app built (see above); deploy steps in README.md.
+- Open: residual bias -0.07 (top -0.15); tails ~6% thin (CAUTION flag in the app covers
+  the worst bucket).

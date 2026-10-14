@@ -7,3 +7,5 @@ data/raw/
 data/synthetic/
 .venv/
 reports/backtest_rows*.parquet
+.streamlit/secrets.toml
+logs/

@@ -29,8 +29,11 @@ for _f in (15, 25, 35, 50):
     ALL_VARIANTS[f"shrink30+A+B{_f}"] = EngineConfig(**S30, position_kappa=True,
                                                      neff_floor=_f)
 
-# Locked config (user sign-off 2026-10-14): shrink30 + A + B50, game-script off, C off.
+# Reference config of the bias study (user sign-off 2026-10-14): shrink30 + A + B50.
+# The L+ variants below are built on it. The live locked config adds O on top:
+# locked_config() == ALL_VARIANTS[LIVE_LOCKED] (O locked 2026-10-14).
 LOCKED = "shrink30+A+B50"
+LIVE_LOCKED = "L+O"
 LOCKED_CFG = dict(**S30, position_kappa=True, neff_floor=50)
 # Mean-bias toggles on top of the locked config. G is reference only (never locked):
 # its kill_mult is refit walk-forward by run_backtest from the LOCKED variant's errors.
@@ -46,6 +49,11 @@ ALL_VARIANTS["L+O+P"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True, fit_prio
 ALL_VARIANTS["L+O+M3"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True,
                                       meta_drift_patches=3)
 ALL_VARIANTS["L+G"] = EngineConfig(**LOCKED_CFG)
+# Softer O fade: min(1, nDef/15) and min(1, nDef/20) instead of /10. Tested --quick
+# 2026-10-14 (reports/backtest_ofade_quick.md): both slightly worse; /10 kept.
+for _d in (15, 20):
+    ALL_VARIANTS[f"L+O{_d}"] = EngineConfig(**LOCKED_CFG, opp_by_outcome=True,
+                                            opp_full_games=_d)
 G_VARIANTS = {"L+G"}
 G_MIN_ROWS = 500           # player-series before G departs from 1.0
 BIAS_VARIANTS = [LOCKED, "L+M1", "L+M2", "L+M3", "L+P", "L+M1+P", "L+M2+P", "L+M3+P",

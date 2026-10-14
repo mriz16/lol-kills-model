@@ -105,7 +105,9 @@ def test_bias_report_builds(processed, monkeypatch):
 
 def test_locked_config_matches_backtest_variant():
     from src.engine.features import locked_config
-    assert locked_config() == ALL_VARIANTS[LOCKED]
+    from src.backtest.walkforward import LIVE_LOCKED
+    assert locked_config() == ALL_VARIANTS[LIVE_LOCKED]
+    assert locked_config().opp_by_outcome and locked_config().opp_full_games == 10
     assert not locked_config().game_script and not locked_config().smooth_bootstrap
 
 
