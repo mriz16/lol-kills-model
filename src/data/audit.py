@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.config import LEAGUE_CODE_ALIASES, POSITIONS
+from src.config import (DOMESTIC_LEAGUES, INTERNATIONAL_LEAGUES, LEAGUE_CODE_ALIASES,
+                        LEAGUES, POSITIONS)
 
-EXPECTED_LEAGUES = ["LCK", "LPL", "LEC", "LCS", "LCKC", "EM", "LFL", "FST", "WLDs", "MSI"]
+# Codes every yearly file should carry (a missing one is a warning in the job log).
+# Other in-scope codes (EWC, LTA, WLRQ, VCS, LJL, PCS) are kept when present.
+EXPECTED_LEAGUES = ["LCK", "LPL", "LEC", "LCS", "CBLOL", "LCP", "LCKC", "EM", "LFL", "FST",
+                    "WLDs", "MSI"]
 
 
 def _md(df: pd.DataFrame) -> str:
@@ -35,8 +39,8 @@ def audit(raw: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
     per_league = per_league.join(kept, how="left").fillna(0).astype(int)
     # Aliased codes (e.g. 2025 "LTA N" -> "LCS") are counted under their canonical code.
     per_league["maps_to"] = [LEAGUE_CODE_ALIASES.get(lg, "") for lg in per_league.index]
-    per_league["in_scope"] = [lg in EXPECTED_LEAGUES or LEAGUE_CODE_ALIASES.get(lg)
-                              in EXPECTED_LEAGUES for lg in per_league.index]
+    per_league["in_scope"] = [lg in LEAGUES or LEAGUE_CODE_ALIASES.get(lg)
+                              in LEAGUES for lg in per_league.index]
     per_league = per_league.reset_index().sort_values(
         ["in_scope", "raw_games"], ascending=[False, False])
 
@@ -44,8 +48,7 @@ def audit(raw: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
     patches = raw["patch"].dropna().astype(str)
     from src.data.oe import patch_key
     pk = sorted(patches.unique(), key=patch_key)
-    in_scope = raw_games[raw_games["league"].replace(LEAGUE_CODE_ALIASES)
-                         .isin(EXPECTED_LEAGUES)]
+    in_scope = raw_games[raw_games["league"].replace(LEAGUE_CODE_ALIASES).isin(LEAGUES)]
     series = teams.drop_duplicates("series_id")
     lines = [
         "# Data audit", "",
@@ -78,6 +81,7 @@ def audit(raw: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
             f"- {r.league}: {r.incomplete_games}/{r.raw_games} games not 'complete' "
             f"(see partial games below)" for r in inc.itertuples()] + [""]
     lines += partial_section(raw)
+    lines += international_section(teams)
     pos = players["position"].astype(str).value_counts()
     odd = sorted(set(pos.index) - set(POSITIONS))
     if odd:
@@ -85,13 +89,30 @@ def audit(raw: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame,
     return "\n".join(lines), missing
 
 
+def international_section(teams: pd.DataFrame) -> list[str]:
+    """Teams kept at each international event, and any of them with no domestic games in
+    the data (their home league is out of scope or its games were all dropped)."""
+    t = teams[["league", "teamname", "date"]].astype({"league": str, "teamname": str})
+    t["year"] = pd.to_datetime(t["date"]).dt.year
+    intl = t[t["league"].isin(INTERNATIONAL_LEAGUES)]
+    if intl.empty:
+        return []
+    home = set(t.loc[t["league"].isin(DOMESTIC_LEAGUES), "teamname"])
+    ev = intl.groupby(["league", "year"])["teamname"].agg(
+        teams=lambda s: s.nunique(), names=lambda s: ", ".join(sorted(s.unique())))
+    lines = ["## International events", "", _md(ev.reset_index()), ""]
+    orphans = sorted(set(intl["teamname"]) - home)
+    lines += ["**Teams at international events with no domestic games in the data:** "
+              + (", ".join(orphans) if orphans else "none."), ""]
+    return lines
+
+
 def partial_section(raw: pd.DataFrame) -> list[str]:
     """Pass/fail counts of "partial" games in PARTIAL_OK_LEAGUES (src.data.oe.partial_check)."""
-    from src.config import PARTIAL_OK_LEAGUES
     from src.data.oe import partial_check
     aliased = raw.assign(league=raw["league"].replace(LEAGUE_CODE_ALIASES))
     chk = partial_check(aliased)
-    lines = [f"## Partial games ({', '.join(PARTIAL_OK_LEAGUES)})", "",
+    lines = ["## Partial games (all in-scope leagues)", "",
              "Kept only if kills/deaths/assists/result/gamelength and playername are "
              "non-null for all 10 players and player kills sum to team kills on both "
              "sides.", ""]

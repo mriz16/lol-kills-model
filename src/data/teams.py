@@ -50,6 +50,17 @@ ALIASES: dict[str, str] = {
     "fly": "FlyQuest", "flyquest": "FlyQuest", "100": "100 Thieves", "100t": "100 Thieves",
     "dig": "Dignitas", "sr": "Shopify Rebellion", "imt": "Immortals", "nrg": "NRG",
     "lyon": "LYON", "dsg": "Disguised", "sen": "Sentinels", "sentinels": "Sentinels",
+    # LCP (Pacific). Only applied when the target name exists in the data; otherwise the
+    # fuzzy matcher handles it.
+    "mvk": "MVK Esports", "mvke": "MVK Esports", "gam": "GAM Esports",
+    "tsw": "Team Secret Whales", "secretwhales": "Team Secret Whales",
+    "cfo": "CTBC Flying Oyster", "flyingoyster": "CTBC Flying Oyster",
+    "dcg": "Deep Cross Gaming", "dfm": "DetonatioN FocusMe", "detonation": "DetonatioN FocusMe",
+    "shg": "Fukuoka SoftBank HAWKS gaming", "gz": "Ground Zero Gaming",
+    # CBLOL / LTA South
+    "loud": "LOUD", "fur": "FURIA", "furia": "FURIA", "vks": "Vivo Keyd Stars",
+    "keyd": "Vivo Keyd Stars", "pain": "paiN Gaming", "png": "paiN Gaming",
+    "red": "RED Kalunga", "fx": "Fluxo W7M", "fluxo": "Fluxo W7M",
 }
 
 
