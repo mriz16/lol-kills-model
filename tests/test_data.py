@@ -12,7 +12,12 @@ def test_process_filters_and_splits(raw, processed):
     assert "partial" in set(raw["datacompleteness"])
     kept = set(teams["gameid"])
     partial = set(raw.loc[raw["datacompleteness"] != "complete", "gameid"])
-    assert not (kept & partial)
+    # partial games are kept only when they pass the kill-consistency check (the
+    # fixture's FST partial game does) and are flagged
+    from src.data.oe import partial_check
+    ok = set(partial_check(raw).query("passed")["gameid"])
+    assert kept & partial == ok & partial and ok
+    assert teams.loc[teams["gameid"].isin(partial), "partial"].all()
     assert (teams.groupby("gameid").size() == 2).all()
     assert (players.groupby("gameid").size() == 10).all()
     # team kills = sum of player kills
@@ -129,13 +134,15 @@ def test_partial_check_and_keep(raw):
     assert chk.loc[ids[0], "passed"] and chk.loc[ids[3], "passed"]
     assert chk.loc[ids[1], "reason"].startswith("null player")
     assert chk.loc[ids[2], "reason"] == "player kills != team kills"
-    assert "FST" not in set(chk["league"])  # only PARTIAL_OK_LEAGUES are checked
+    assert "FST" in set(chk["league"])    # every in-scope league is checked
+    assert "LDL" not in set(chk["league"])  # out-of-scope leagues are not
 
     players, teams = process(r)
     kept = set(teams["gameid"])
     assert {ids[0], ids[3]} <= kept and not ({ids[1], ids[2]} & kept)
     assert teams.loc[teams["gameid"].isin([ids[0], ids[3]]), "partial"].all()
-    assert not teams.loc[~teams["gameid"].isin(ids), "partial"].any()
+    other = set(raw.loc[raw["datacompleteness"] != "complete", "gameid"])
+    assert not teams.loc[~teams["gameid"].isin(set(ids) | other), "partial"].any()
     # team kills / deaths filled from the player rows
     g = teams[teams["gameid"] == ids[0]].sort_values("side")
     pk = players[players["gameid"] == ids[0]].groupby("side", observed=True)["kills"].sum()
@@ -156,3 +163,29 @@ def test_audit_reports_partial(raw):
     text, _ = audit(r, players, teams)
     assert "LPL 2025 partial games: 3 pass, 1 fail" in text
     assert "player kills != team kills" in text
+
+
+def test_worlds_feeder_leagues_in_scope():
+    from src.config import (DOMESTIC_LEAGUES, ELO_LEAGUE_INIT, INTERNATIONAL_LEAGUES,
+                            LEAGUE_CODE_ALIASES, LEAGUES, PARTIAL_OK_LEAGUES)
+    # every region that sends teams to Worlds / MSI, plus the international events
+    assert {"LCK", "LPL", "LEC", "LCS", "CBLOL", "LCP"} <= set(DOMESTIC_LEAGUES)
+    assert {"WLDs", "MSI", "FST", "EWC"} <= set(INTERNATIONAL_LEAGUES)
+    assert LEAGUE_CODE_ALIASES["LTA S"] == "CBLOL"
+    assert set(PARTIAL_OK_LEAGUES) == set(LEAGUES)
+    assert set(DOMESTIC_LEAGUES) <= set(ELO_LEAGUE_INIT)
+
+
+def test_lcp_and_partial_worlds_games_kept(raw):
+    """An LCP team (e.g. MVK) and its partial Worlds games make it into the data."""
+    import src.data.oe as oe
+    from src.data.audit import audit
+    lec = raw["league"] == "LEC"
+    fst = raw["league"] == "FST"
+    r = raw.assign(league=raw["league"].mask(lec, "LCP").mask(fst, "WLDs"))
+    players, teams = oe.process(r)
+    assert {"LCP", "WLDs"} <= set(teams["league"].astype(str))
+    assert teams.loc[teams["league"] == "WLDs", "partial"].any()   # partial Worlds game kept
+    text, _ = audit(r, players, teams)
+    assert "## International events" in text
+    assert "no domestic games in the data:** " in text

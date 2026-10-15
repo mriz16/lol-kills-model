@@ -16,8 +16,9 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 
 ### Data
 - Source: OE yearly match CSV from Google Drive, downloaded with `gdown` by
-  `scripts/refresh_data.py`. Keep `datacompleteness == "complete"`, plus **LPL "partial"**
-  games (`PARTIAL_OK_LEAGUES`, signed off 2026-10-14) only if kills, deaths, assists, result
+  `scripts/refresh_data.py`. Keep `datacompleteness == "complete"`, plus **"partial"**
+  games (`PARTIAL_OK_LEAGUES`: LPL signed off 2026-10-14, extended to every in-scope league
+  2026-10-15 because partial Worlds play-in games were dropped) only if kills, deaths, assists, result
   and gamelength are non-null for all 10 players (and playername, needed for lineups) AND
   sum of player kills == team kills on each side (`src.data.oe.partial_check`). Team-level
   kills/deaths/result/length of those games are filled from the player rows; parquet
@@ -27,8 +28,12 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 - `.github/workflows/refresh.yml` runs the refresh daily and commits updated parquet.
 - The dev sandbox may block Google Drive: tests must never depend on it. Tests use the
   synthetic OE-schema fixture in `tests/fixtures/`.
-- Leagues: LCK, LPL, LEC, LCS, LCKC, EM, LFL, FST + international events (Worlds = OE code
-  `WLDs`, MSI). Config in `src/config.py`.
+- Leagues (extended 2026-10-15 so every Worlds / MSI team has home-league data): domestic
+  LCK, LPL, LEC, LCS, CBLOL (2025 `LTA S` aliased), LCP (Pacific: GAM, MVK, TSW, CFO, ...)
+  + feeders LCKC, EM, LFL, VCS, LJL, PCS; international WLDs (Worlds), MSI, FST, EWC,
+  LTA (2025 cross-conference), WLRQ. Out of scope: KeSPA Cup, second divisions. Config in
+  `src/config.py`. The audit lists the teams at each international event and flags any
+  without domestic games.
 - Team-name alias table + fuzzy matcher (`src/data/teams.py`).
 - OE has no series id; series are inferred from consecutive games of the same team pair
   (new series when game number resets or > 1 day gap). Best-of inferred as 2*max_wins-1.
