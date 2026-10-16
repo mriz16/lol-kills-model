@@ -222,7 +222,9 @@ class _Resp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(self.status_code)
+            err = RuntimeError(self.status_code)
+            err.response = self  # like requests.HTTPError
+            raise err
 
 
 class FakeGitHub:
@@ -232,6 +234,8 @@ class FakeGitHub:
         self.headers, self.files, self.branches = {}, {}, {"main"}
 
     def get(self, url, params=None, timeout=None, headers=None):
+        if "/repos/o/r" not in url:
+            return _Resp(404)
         if url.endswith("/branches/picks-log"):
             return _Resp(200 if "picks-log" in self.branches else 404)
         if url.endswith("/git/ref/heads/main"):
@@ -269,6 +273,22 @@ def test_log_write_read_github_api():
     picklog.append_picks(store, _rows("S2"))
     df = picklog.read_picks(store)
     assert list(df["slip_id"]) == ["S1", "S1", "S2", "S2"]
+
+
+def test_log_check_creates_branch_and_reports_errors():
+    fake = FakeGitHub()
+    ok, msg = picklog.GitHubStore("tok", "o/r", session=fake).check()
+    assert ok and "created now" in msg and "picks-log" in fake.branches
+    ok, msg = picklog.GitHubStore("tok", "o/r", session=fake).check()
+    assert ok and "created" not in msg
+    ok, msg = picklog.GitHubStore("tok", "o/other", session=fake).check()
+    assert not ok and "cannot see o/other" in msg
+
+    class ReadOnly(FakeGitHub):
+        def post(self, url, json=None, timeout=None):
+            return _Resp(403)
+    ok, msg = picklog.GitHubStore("tok", "o/r", session=ReadOnly()).check()
+    assert not ok and "Contents: Read and write" in msg
 
 
 # ------------------------------------------------------------------ app on fixture ----

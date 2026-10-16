@@ -7,14 +7,20 @@ Usage:
 
 OE publishes one CSV per year in a public Google Drive folder. The folder id can be
 overridden with OE_DRIVE_FOLDER_ID; individual file ids with OE_FILE_ID_<YEAR>.
+
+Drive throttles popular files ("Too many users have viewed or downloaded this file
+recently"), so each download is retried with backoff, and `--cache-dir` keeps finished
+years' CSVs (any year before the current one) so a run only hits Drive for this year.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import os
+import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -33,23 +39,67 @@ class DataError(RuntimeError):
 
 DEFAULT_FOLDER_ID = "1gLSw0RLjBbtaNy0dgnGQDAZOHIgCe-HH"
 FILE_TEMPLATE = "{year}_LoL_esports_match_data_from_OraclesElixir.csv"
+RETRY_WAITS = (60, 180, 420)  # seconds between download attempts (Drive quota errors)
 
 
-def download_year(year: int, out_dir: Path) -> Path:
+def _retry(fn, what: str, waits=RETRY_WAITS):
+    """Call fn(); on a Drive error wait and try again. FileNotFoundError is not retried."""
+    for attempt in range(len(waits) + 1):
+        try:
+            return fn()
+        except FileNotFoundError:
+            raise
+        except Exception as exc:  # gdown.FileURLRetrievalError, HTTP errors, ...
+            msg = str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc)
+            if attempt == len(waits):
+                raise DataError(f"{what}: Google Drive refused the download after "
+                                f"{attempt + 1} tries ({msg})") from exc
+            print(f"::warning::{what}: attempt {attempt + 1} failed ({msg}); "
+                  f"retrying in {waits[attempt]} s")
+            time.sleep(waits[attempt])
+
+
+def download_year(year: int, out_dir: Path, waits=RETRY_WAITS) -> Path:
     import gdown
 
     target = out_dir / FILE_TEMPLATE.format(year=year)
+
+    def get(file_id):
+        target.unlink(missing_ok=True)
+        if not gdown.download(id=file_id, output=str(target), quiet=False):
+            raise RuntimeError("gdown returned no file")
+        check_not_html(target)  # a quota page saved as the CSV is retried too
+
     file_id = os.environ.get(f"OE_FILE_ID_{year}")
-    if file_id:
-        gdown.download(id=file_id, output=str(target), quiet=False)
-        return target
-    folder = os.environ.get("OE_DRIVE_FOLDER_ID") or DEFAULT_FOLDER_ID
-    files = gdown.download_folder(id=folder, skip_download=True, quiet=True) or []
-    match = [f for f in files if Path(f.path).name == target.name]
-    if not match:
-        raise FileNotFoundError(f"{target.name} not found in Drive folder {folder}")
-    gdown.download(id=match[0].id, output=str(target), quiet=False)
+    if not file_id:
+        folder = os.environ.get("OE_DRIVE_FOLDER_ID") or DEFAULT_FOLDER_ID
+        files = _retry(lambda: gdown.download_folder(id=folder, skip_download=True,
+                                                     quiet=True) or [],
+                       f"listing Drive folder {folder}", waits)
+        match = [f for f in files if Path(f.path).name == target.name]
+        if not match:
+            raise FileNotFoundError(f"{target.name} not found in Drive folder {folder}")
+        file_id = match[0].id
+    _retry(lambda: get(file_id), target.name, waits)
     return target
+
+
+def fetch_year(year: int, tmp: Path, cache_dir: Path | None, this_year: int) -> Path:
+    """A finished year (before this_year) comes from cache_dir when present."""
+    name = FILE_TEMPLATE.format(year=year)
+    cached = cache_dir / name if cache_dir else None
+    if cached is not None and year < this_year and cached.exists():
+        try:
+            check_not_html(cached)
+            print(f"{name}: using cached copy")
+            return cached
+        except DataError:
+            cached.unlink()
+    path = download_year(year, tmp)
+    if cached is not None and year < this_year:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, cached)
+    return path
 
 
 def check_not_html(path: Path) -> None:
@@ -89,6 +139,8 @@ def main(argv=None) -> int:
     ap.add_argument("--csv", type=Path, nargs="*", help="use local CSV(s) instead of Drive")
     ap.add_argument("--out", type=Path, default=DATA_DIR)
     ap.add_argument("--audit", type=Path, default=REPORTS_DIR / "data_audit.md")
+    ap.add_argument("--cache-dir", type=Path,
+                    help="keep / reuse CSVs of finished years (before the current one)")
     args = ap.parse_args(argv)
     try:
         return run(args)
@@ -108,7 +160,7 @@ def run(args) -> int:
         paths = []
         for y in years:
             try:
-                paths.append(download_year(y, tmp))
+                paths.append(fetch_year(y, tmp, args.cache_dir, this_year))
             except FileNotFoundError as exc:  # e.g. next year's file not published yet
                 print(f"::warning::{exc}")
         if not paths:

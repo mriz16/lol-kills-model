@@ -119,10 +119,19 @@ def log_slate(store: DataStore, df: pd.DataFrame):
     try:
         slatelog.append_slate(log_store, rows)
         ss()["log_nonce"] += 1
-        st.caption(f"Slate log: {len(rows)} line(s) saved for {meta['slate_date']}"
-                   + ("" if remote else " (local disk only: set GitHub secrets)."))
+        if remote:
+            st.caption(f"Slate log: {len(rows)} line(s) saved to GitHub for "
+                       f"{meta['slate_date']}.")
+        else:
+            st.error(f"Slate NOT saved to GitHub ({len(rows)} lines kept on the app's "
+                     "temporary disk, wiped on restart): no GitHub secrets. Use the "
+                     "download below, and see Record → Log connection.")
     except Exception as exc:
-        st.error(f"Could not write the slate log: {exc}")
+        st.error(f"Could not save the slate log: {exc}. Use the download below, and see "
+                 "Record → Log connection.")
+    st.download_button("Download this slate (CSV)", pd.DataFrame(rows).to_csv(index=False),
+                       file_name=f"slate_{meta['slate_date']}_{meta['slate_id']}.csv",
+                       mime="text/csv", key=f"dl_slate_{meta['slate_id']}")
 
 
 def mark_played(row_ids: list[str]) -> bool:
@@ -534,18 +543,31 @@ def slip_tab():
             picklog.append_picks(store, rows)
             ss()["log_nonce"] += 1
             mark_played([l["row_id"] for l in legs])
-            st.success(f"Logged slip {rows[0]['slip_id']} ({len(rows)} legs)"
-                       + ("" if remote else " locally. Set GitHub secrets to keep it."))
+            if remote:
+                st.success(f"Logged slip {rows[0]['slip_id']} ({len(rows)} legs) to GitHub.")
+            else:
+                st.error(f"Slip {rows[0]['slip_id']} NOT saved to GitHub (temporary disk "
+                         "only): no GitHub secrets. Download it below.")
         except Exception as exc:
-            st.error(f"Could not write the log: {exc}")
+            st.error(f"Could not save the slip: {exc}. Download it below, and see "
+                     "Record → Log connection.")
+        st.download_button("Download this slip (CSV)", pd.DataFrame(rows).to_csv(index=False),
+                           file_name=f"slip_{rows[0]['slip_id']}.csv", mime="text/csv")
 
 
 # ============================================================== record tab ====
 def record_tab(store: DataStore):
-    _, remote = get_log_store()
+    log_store, remote = get_log_store()
     if not remote:
-        st.warning("No GitHub secrets: the log is read from the app's local disk, which "
-                   "Streamlit Cloud wipes on restart. See README.")
+        st.error("No GitHub secrets: slates and slips are NOT being saved (the app's disk "
+                 "is wiped on restart). Add the [github] block under the app's Settings → "
+                 "Secrets on share.streamlit.io (README step 2).")
+    with st.expander("Log connection", expanded=not remote):
+        if not remote:
+            st.caption("Secrets missing: `[github] token`, `repo` not found.")
+        elif st.button("Test log connection"):
+            ok, msg = log_store.check()
+            (st.success if ok else st.error)(msg)
     if st.button("Refresh"):
         ss()["log_nonce"] += 1
     slate_log_section(store)
@@ -638,6 +660,11 @@ cal_note = (f"S + I (beta) + W ({store.w_source})" if store.calibrated
 if store.backfill:
     st.warning(f"BACKFILL {ASOF}: projections use only games before {ASOF} "
                f"(last game in window {store.last_date:%Y-%m-%d}).")
+age = (pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timestamp(store.last_date)).days
+if not store.backfill and age >= 2:
+    st.warning(f"Match data ends {store.last_date:%Y-%m-%d} ({age} days ago). If games were "
+               "played since, the daily refresh failed (GitHub → Actions → refresh-data); "
+               "recent form and rosters are missing from these projections.")
 st.caption(f"OE data through {store.last_date:%Y-%m-%d} · patch {store.patch_name} · "
            f"locked model (shrink30 + A + B50 + O + S), 20,000 sims · {cal_note}")
 tabs = st.tabs(["Slate", "Screenshot (beta)", "Results", "Slip", "Record"])
