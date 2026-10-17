@@ -25,7 +25,11 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
   carries a `partial` flag; the audit logs pass/fail counts per year. Split player rows
   (positions top/jng/mid/bot/sup) from team rows (`position == "team"`). Write compact
   parquet to `data/` (`players.parquet`, `teams.parquet`).
-- `.github/workflows/refresh.yml` runs the refresh daily and commits updated parquet.
+- `.github/workflows/refresh.yml` runs the refresh 3x daily (03:17 / 11:17 / 19:17 UTC) and
+  commits updated parquet. Drive quota errors ("Too many users have viewed or downloaded")
+  are retried with backoff (60 / 180 / 420 s); finished years' CSVs are kept in the Actions
+  cache (`--cache-dir .oe_cache`) so a run downloads only the current year. Grading runs
+  even when the download fails. The app warns when the data ends >= 2 days ago.
 - The dev sandbox may block Google Drive: tests must never depend on it. Tests use the
   synthetic OE-schema fixture in `tests/fixtures/`.
 - Leagues (extended 2026-10-15 so every Worlds / MSI team has home-league data): domestic
@@ -166,6 +170,9 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
 - Backfill mode: `DataStore(asof=date)` keeps only games before 00:00 UTC of the date
   (pools, rosters, lineups, kappas, calibrator); rows logged with `backfill = 1`; slips
   can only be marked played (no pick-log write).
+- Saves: a slate / slip that only reached local disk (no secrets) or failed shows an
+  error plus a CSV download; Record → Log connection tests the token (`GitHubStore.check`,
+  creates `picks-log` if missing).
 - Pick log: `picklog.GitHubStore` writes `logs/picks.csv` to branch `picks-log` via the
   contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
   `refresh.yml` grades into `logs/graded.csv` on that branch; Record tab merges those

@@ -75,7 +75,7 @@ On share.streamlit.io, open the app's **⋮** menu → **Settings** → **Secret
 values and save. The app restarts with the new values.
 
 ### Pick-log grading
-The `refresh-data` workflow runs daily at 09:17 UTC, or on demand from Actions → refresh-data →
+The `refresh-data` workflow runs three times a day (03:17, 11:17, 19:17 UTC; Google Drive sometimes throttles OE's files with "Too many users have viewed or downloaded this file recently", so each run retries with backoff and a blocked run is retried by the next one; last year's CSV is kept in the Actions cache), or on demand from Actions → refresh-data →
 Run workflow. After refreshing the data, it checks out `picks-log`, grades every pending
 pick against the new OE data, and commits `logs/graded.csv`. It needs no extra secret; it
 uses the workflow's own `GITHUB_TOKEN`. The Record tab also grades pending picks live from

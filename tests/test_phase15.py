@@ -180,3 +180,55 @@ def test_refresh_fails_loudly_on_empty(tmp_path):
                         str(tmp_path / "a.md")], capture_output=True, text=True)
     assert r.returncode == 1
     assert "0 rows" in r.stdout
+
+
+# ------------------------------------------------- refresh: Drive quota retry + cache ----
+def _refresh_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("refresh_data",
+                                                  ROOT / "scripts" / "refresh_data.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _fake_gdown(monkeypatch, fail_first: int, calls: list):
+    import types
+
+    def download(id, output, quiet):
+        calls.append(id)
+        if len(calls) <= fail_first:
+            raise RuntimeError("Too many users have viewed or downloaded this file recently.")
+        Path(output).write_text("gameid,league\nG1,LCK\n")
+        return output
+    monkeypatch.setitem(sys.modules, "gdown", types.SimpleNamespace(download=download))
+
+
+def test_refresh_retries_drive_quota(monkeypatch, tmp_path):
+    rd = _refresh_module()
+    calls = []
+    _fake_gdown(monkeypatch, 2, calls)
+    monkeypatch.setenv("OE_FILE_ID_2026", "fid")
+    monkeypatch.setattr(rd.time, "sleep", lambda s: None)
+    path = rd.download_year(2026, tmp_path)
+    assert len(calls) == 3 and path.read_text().startswith("gameid")
+
+    calls.clear()
+    _fake_gdown(monkeypatch, 99, calls)
+    with pytest.raises(rd.DataError, match="refused the download after 4 tries"):
+        rd.download_year(2026, tmp_path)
+
+
+def test_refresh_caches_finished_years_only(monkeypatch, tmp_path):
+    rd = _refresh_module()
+    calls = []
+    _fake_gdown(monkeypatch, 0, calls)
+    monkeypatch.setenv("OE_FILE_ID_2025", "f25")
+    monkeypatch.setenv("OE_FILE_ID_2026", "f26")
+    cache = tmp_path / "cache"
+    (tmp_path / "t").mkdir()
+    for _ in range(2):
+        rd.fetch_year(2025, tmp_path / "t", cache, this_year=2026)
+        rd.fetch_year(2026, tmp_path / "t", cache, this_year=2026)
+    assert calls == ["f25", "f26", "f26"]  # last year downloaded once, this year each run
+    assert [p.name for p in cache.iterdir()] == [rd.FILE_TEMPLATE.format(year=2025)]
