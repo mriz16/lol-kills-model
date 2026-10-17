@@ -277,17 +277,17 @@ def test_log_write_read_github_api():
 
 def test_log_check_creates_branch_and_reports_errors():
     fake = FakeGitHub()
-    ok, msg = picklog.GitHubStore("tok", "o/r", session=fake).check()
+    ok, msg = picklog.check_store(picklog.GitHubStore("tok", "o/r", session=fake))
     assert ok and "created now" in msg and "picks-log" in fake.branches
-    ok, msg = picklog.GitHubStore("tok", "o/r", session=fake).check()
+    ok, msg = picklog.check_store(picklog.GitHubStore("tok", "o/r", session=fake))
     assert ok and "created" not in msg
-    ok, msg = picklog.GitHubStore("tok", "o/other", session=fake).check()
+    ok, msg = picklog.check_store(picklog.GitHubStore("tok", "o/other", session=fake))
     assert not ok and "cannot see o/other" in msg
 
     class ReadOnly(FakeGitHub):
         def post(self, url, json=None, timeout=None):
             return _Resp(403)
-    ok, msg = picklog.GitHubStore("tok", "o/r", session=ReadOnly()).check()
+    ok, msg = picklog.check_store(picklog.GitHubStore("tok", "o/r", session=ReadOnly()))
     assert not ok and "Contents: Read and write" in msg
 
 

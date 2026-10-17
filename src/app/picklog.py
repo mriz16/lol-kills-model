@@ -104,29 +104,6 @@ class GitHubStore:
         if c.status_code not in (201, 422):  # 422: created concurrently
             c.raise_for_status()
 
-    def check(self) -> tuple[bool, str]:
-        """Can the app write the log? Creates the log branch if missing (that is the write
-        test: it needs the same Contents: write permission as saving a pick)."""
-        try:
-            r = self.s.get(f"{self.API}/repos/{self.repo}", timeout=20)
-            if r.status_code == 401:
-                return False, "GitHub rejected the token (expired or mistyped): make a new one."
-            if r.status_code == 404:
-                return False, (f"The token cannot see {self.repo}: check `repo` in the "
-                               "secrets and the token's repository access.")
-            r.raise_for_status()
-            b = self.s.get(f"{self.API}/repos/{self.repo}/branches/{self.branch}", timeout=20)
-            existed = b.status_code != 404
-            self._ensure_branch()
-        except Exception as exc:
-            code = getattr(getattr(exc, "response", None), "status_code", None)
-            if code == 403:
-                return False, ("The token can read the repo but not write: give it "
-                               "Contents: Read and write.")
-            return False, f"GitHub error: {exc}"
-        return True, (f"OK: writing to {self.repo}, branch `{self.branch}`"
-                      + ("." if existed else " (created now)."))
-
     def write(self, path: str, text: str, message: str, sha: str | None) -> None:
         if sha is None:
             self._ensure_branch()
@@ -140,6 +117,32 @@ class GitHubStore:
         if r.status_code == 409:
             raise ConflictError(path)
         r.raise_for_status()
+
+
+def check_store(store) -> tuple[bool, str]:
+    """Can the app write the log (GitHubStore)? Creates the log branch if missing (that is
+    the write test: it needs the same Contents: write permission as saving a pick). A
+    function, not a method, so it also works on a store that st.cache_resource kept from
+    an older deploy of this module."""
+    try:
+        r = store.s.get(f"{store.API}/repos/{store.repo}", timeout=20)
+        if r.status_code == 401:
+            return False, "GitHub rejected the token (expired or mistyped): make a new one."
+        if r.status_code == 404:
+            return False, (f"The token cannot see {store.repo}: check `repo` in the "
+                           "secrets and the token's repository access.")
+        r.raise_for_status()
+        b = store.s.get(f"{store.API}/repos/{store.repo}/branches/{store.branch}", timeout=20)
+        existed = b.status_code != 404
+        store._ensure_branch()
+    except Exception as exc:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        if code == 403:
+            return False, ("The token can read the repo but not write: give it "
+                           "Contents: Read and write.")
+        return False, f"GitHub error: {exc}"
+    return True, (f"OK: writing to {store.repo}, branch `{store.branch}`"
+                  + ("." if existed else " (created now)."))
 
 
 # --------------------------------------------------------------------- read / write --
