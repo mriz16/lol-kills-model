@@ -1,13 +1,13 @@
 # Data audit
 
 Sources: 2025_LoL_esports_match_data_from_OraclesElixir.csv, 2026_LoL_esports_match_data_from_OraclesElixir.csv  
-Raw rows: 236,328; raw games: 19,694  
-Date range: 2025-01-11 11:11:24 -> 2026-10-14 18:23:21  
+Raw rows: 236,772; raw games: 19,731  
+Date range: 2025-01-11 11:11:24 -> 2026-10-16 01:01:24  
 Patch range: 15.01 -> 16.2 (43 patches)  
-Kept (complete + passing partial, in-scope): 9,473 games, 4,240 series, 94,730 player rows  
+Kept (complete + passing partial, in-scope): 9,482 games, 4,242 series, 94,820 player rows  
 Incomplete in-scope games: 949 (kept as passing partial: 949)  
-Series with a missing map (excluded from backtest): 12  
-Best-of inferred: {1: 1229, 3: 2294, 5: 717}
+Series with a missing map (excluded from backtest): 11  
+Best-of inferred: {1: 1229, 3: 2294, 5: 719}
 
 ## Expected league codes
 
@@ -28,7 +28,7 @@ LTA N -> LCS, LTA North -> LCS, LTA S -> CBLOL, LTA South -> CBLOL
 | LPL | 1479 | 931 | 17748 | 1479 | 562 |  | True |
 | LCK | 1057 | 0 | 12684 | 1057 | 397 |  | True |
 | LCKC | 1033 | 0 | 12396 | 1033 | 386 |  | True |
-| EM | 957 | 0 | 11484 | 957 | 467 |  | True |
+| EM | 958 | 0 | 11496 | 958 | 467 |  | True |
 | LJL | 737 | 0 | 8844 | 737 | 596 |  | True |
 | LEC | 691 | 0 | 8292 | 691 | 329 |  | True |
 | LFL | 593 | 0 | 7116 | 593 | 360 |  | True |
@@ -41,7 +41,7 @@ LTA N -> LCS, LTA North -> LCS, LTA S -> CBLOL, LTA South -> CBLOL
 | LTA S | 222 | 0 | 2664 | 222 | 93 | CBLOL | True |
 | LTA N | 214 | 0 | 2568 | 214 | 93 | LCS | True |
 | MSI | 151 | 0 | 1812 | 151 | 39 |  | True |
-| WLDs | 108 | 12 | 1296 | 108 | 47 |  | True |
+| WLDs | 116 | 12 | 1392 | 116 | 49 |  | True |
 | FST | 80 | 0 | 960 | 80 | 26 |  | True |
 | LTA | 40 | 0 | 480 | 40 | 13 |  | True |
 | WLRQ | 6 | 6 | 72 | 6 | 6 |  | True |
@@ -73,10 +73,10 @@ LTA N -> LCS, LTA North -> LCS, LTA S -> CBLOL, LTA South -> CBLOL
 | WSCI | 85 | 0 | 1020 | 0 | 0 |  | False |
 | DCup | 81 | 6 | 972 | 0 | 0 |  | False |
 | PRMP | 73 | 0 | 876 | 0 | 0 |  | False |
+| DCGI | 67 | 28 | 804 | 0 | 0 |  | False |
 | CT | 50 | 0 | 600 | 0 | 0 |  | False |
 | ASI | 42 | 0 | 504 | 0 | 0 |  | False |
 | CCWS | 40 | 0 | 480 | 0 | 0 |  | False |
-| DCGI | 39 | 0 | 468 | 0 | 0 |  | False |
 | IC | 28 | 0 | 336 | 0 | 0 |  | False |
 | AC | 19 | 0 | 228 | 0 | 0 |  | False |
 
@@ -110,7 +110,7 @@ Kept only if kills/deaths/assists/result/gamelength and playername are non-null 
 | MSI | 2025 | 10 | Anyone's Legend, Bilibili Gaming, CTBC Flying Oyster, FURIA, FlyQuest, G2 Esports, GAM Esports, Gen.G, Movistar KOI, T1 |
 | MSI | 2026 | 11 | Bilibili Gaming, Deep Cross Gaming, FURIA, G2 Esports, Hanwha Life Esports, Karmine Corp, LYON, T1, Team Liquid, Team Secret Whales, Top Esports |
 | WLDs | 2025 | 19 | 100 Thieves, Anyone's Legend, Bilibili Gaming, CTBC Flying Oyster, FlyQuest, Fnatic, G2 Esports, Gen.G, Hanwha Life Esports, Invictus Gaming, JD Gaming, KT Rolster, Movistar KOI, PSG Talon, T1, Team Secret Whales, Top Esports, Vivo Keyd Stars, Weibo Gaming |
-| WLDs | 2026 | 4 | Invictus Gaming, JD Gaming, Team WE, Top Esports |
+| WLDs | 2026 | 8 | Cloud9, FURIA, Invictus Gaming, JD Gaming, Karmine Corp, MVK Esports, Team WE, Top Esports |
 | WLRQ | 2026 | 8 | Bilibili Gaming Junior, EDG Youth Team, Ocean & Kimi Tournament Alliance, Top Esports Challenger, Weibo Gaming Youth Team, ZSK, 小爬虫, 我超威 |
 
 **Teams at international events with no domestic games in the data:** Bilibili Gaming Junior, EDG Youth Team, Ocean & Kimi Tournament Alliance, Team Secret, Top Esports Challenger, Weibo Gaming Youth Team, ZSK, 小爬虫, 我超威
