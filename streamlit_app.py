@@ -566,7 +566,7 @@ def record_tab(store: DataStore):
         if not remote:
             st.caption("Secrets missing: `[github] token`, `repo` not found.")
         elif st.button("Test log connection"):
-            ok, msg = log_store.check()
+            ok, msg = picklog.check_store(log_store)
             (st.success if ok else st.error)(msg)
     if st.button("Refresh"):
         ss()["log_nonce"] += 1

@@ -171,7 +171,7 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   (pools, rosters, lineups, kappas, calibrator); rows logged with `backfill = 1`; slips
   can only be marked played (no pick-log write).
 - Saves: a slate / slip that only reached local disk (no secrets) or failed shows an
-  error plus a CSV download; Record → Log connection tests the token (`GitHubStore.check`,
+  error plus a CSV download; Record → Log connection tests the token (`picklog.check_store`,
   creates `picks-log` if missing).
 - Pick log: `picklog.GitHubStore` writes `logs/picks.csv` to branch `picks-log` via the
   contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
