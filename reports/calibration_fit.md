@@ -1,6 +1,6 @@
 # Calibration fit (S, I, W)
 
-Fitted 2026-10-15T03:16:12+00:00 on 36,911 backtest player-series through 2026-10-13 (walk-forward, weekly refits, fits use series >= 1 day before). Base = live locked config L+O; S and I-beta on top; W on the S+I probabilities at proxy lines (rolling median of the player's last 10 market totals, floored, + 0.5).
+Fitted 2026-10-19T17:32:36+00:00 on 36,941 backtest player-series through 2026-10-15 (walk-forward, weekly refits, fits use series >= 1 day before). Base = live locked config L+O; S and I-beta on top; W on the S+I probabilities at proxy lines (rolling median of the player's last 10 market totals, floored, + 0.5).
 
 ## Drift check
 
@@ -12,9 +12,9 @@ Displayed P = p_line + lambda (p_cal - p_line), p_line = (1 - P(push)) / 2.
 
 | _pool | Map 1 | Maps 1-2 | Maps 1-3 |
 |---|---|---|---|
-| 0.8984 | 0.8653 | 0.9411 | 0.8503 |
+| 0.8953 | 0.8630 | 0.9413 | 0.8425 |
 
-Selected picks in the fit: 2332.
+Selected picks in the fit: 2342.
 
 ### Weekly fits (latest 8)
 
@@ -35,12 +35,12 @@ Selected picks in the fit: 2332.
 
 | selection | W | n | pred | hit | diff | se | n_more | pred_more | hit_more | n_less | pred_less | hit_less |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| top 1 | before | 468 | 0.8865 | 0.8269 | -0.0595 | 0.0175 | 96 | 0.8752 | 0.8229 | 372 | 0.8894 | 0.8280 |
-| top 1 | after | 468 | 0.8598 | 0.8312 | -0.0286 | 0.0173 | 99 | 0.8501 | 0.8182 | 369 | 0.8624 | 0.8347 |
-| top 3 | before | 1404 | 0.8545 | 0.8155 | -0.0390 | 0.0104 | 302 | 0.8462 | 0.8311 | 1102 | 0.8568 | 0.8113 |
-| top 3 | after | 1404 | 0.8302 | 0.8170 | -0.0132 | 0.0103 | 303 | 0.8210 | 0.8317 | 1101 | 0.8327 | 0.8129 |
-| top 5 | before | 2334 | 0.8332 | 0.7956 | -0.0376 | 0.0083 | 546 | 0.8228 | 0.8040 | 1788 | 0.8364 | 0.7931 |
-| top 5 | after | 2334 | 0.8104 | 0.7969 | -0.0135 | 0.0083 | 551 | 0.8001 | 0.8076 | 1783 | 0.8136 | 0.7936 |
+| top 1 | before | 470 | 0.8861 | 0.8234 | -0.0627 | 0.0176 | 97 | 0.8742 | 0.8144 | 373 | 0.8892 | 0.8257 |
+| top 1 | after | 470 | 0.8594 | 0.8277 | -0.0317 | 0.0174 | 100 | 0.8489 | 0.8100 | 370 | 0.8622 | 0.8324 |
+| top 3 | before | 1410 | 0.8541 | 0.8135 | -0.0407 | 0.0104 | 304 | 0.8458 | 0.8289 | 1106 | 0.8565 | 0.8092 |
+| top 3 | after | 1410 | 0.8297 | 0.8149 | -0.0148 | 0.0103 | 305 | 0.8204 | 0.8295 | 1105 | 0.8323 | 0.8109 |
+| top 5 | before | 2344 | 0.8329 | 0.7944 | -0.0385 | 0.0083 | 548 | 0.8226 | 0.8029 | 1796 | 0.8360 | 0.7918 |
+| top 5 | after | 2344 | 0.8100 | 0.7956 | -0.0143 | 0.0083 | 553 | 0.7998 | 0.8065 | 1791 | 0.8131 | 0.7923 |
 
 ## Minimum edge on W-adjusted edges
 
@@ -48,22 +48,22 @@ Selected picks in the fit: 2332.
 
 | selection | n | pred | hit | diff | se | n_more | pred_more | hit_more | n_less | pred_less | hit_less | required |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| top 1 | 468 | 0.8598 | 0.8312 | -0.0286 | 0.0173 | 99 | 0.8501 | 0.8182 | 369 | 0.8624 | 0.8347 | 0.0632 |
-| top 3 | 1404 | 0.8302 | 0.8170 | -0.0132 | 0.0103 | 303 | 0.8210 | 0.8317 | 1101 | 0.8327 | 0.8129 | 0.0339 |
-| top 5 | 2334 | 0.8104 | 0.7969 | -0.0135 | 0.0083 | 551 | 0.8001 | 0.8076 | 1783 | 0.8136 | 0.7936 | 0.0301 |
-| all edge > 0 | 22942 | 0.6831 | 0.6712 | -0.0119 | 0.0031 | 7361 | 0.6714 | 0.6659 | 15581 | 0.6886 | 0.6737 | 0.0181 |
+| top 1 | 470 | 0.8594 | 0.8277 | -0.0317 | 0.0174 | 100 | 0.8489 | 0.8100 | 370 | 0.8622 | 0.8324 | 0.0666 |
+| top 3 | 1410 | 0.8297 | 0.8149 | -0.0148 | 0.0103 | 305 | 0.8204 | 0.8295 | 1105 | 0.8323 | 0.8109 | 0.0355 |
+| top 5 | 2344 | 0.8100 | 0.7956 | -0.0143 | 0.0083 | 553 | 0.7998 | 0.8065 | 1791 | 0.8131 | 0.7923 | 0.0310 |
+| all edge > 0 | 22967 | 0.6830 | 0.6708 | -0.0122 | 0.0031 | 7369 | 0.6714 | 0.6656 | 15598 | 0.6885 | 0.6732 | 0.0184 |
 
 ## S: spread k (position|market)
 
 | position|market | k |
 |---|---|
-| _pool | 1.066 |
+| _pool | 1.067 |
 | bot|Map 1 | 1.017 |
 | bot|Maps 1-2 | 1.085 |
 | bot|Maps 1-3 | 1.099 |
 | jng|Map 1 | 1.032 |
 | jng|Maps 1-2 | 1.055 |
-| jng|Maps 1-3 | 1.076 |
+| jng|Maps 1-3 | 1.078 |
 | mid|Map 1 | 1.006 |
 | mid|Maps 1-2 | 1.064 |
 | mid|Maps 1-3 | 1.087 |
@@ -78,4 +78,4 @@ Selected picks in the fit: 2332.
 
 | p=0.1 | p=0.3 | p=0.5 | p=0.7 | p=0.9 |
 |---|---|---|---|---|
-| 0.1197 | 0.3084 | 0.5010 | 0.7069 | 0.9154 |
+| 0.1199 | 0.3085 | 0.5010 | 0.7069 | 0.9154 |
