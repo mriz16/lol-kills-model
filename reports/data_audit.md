@@ -1,13 +1,13 @@
 # Data audit
 
 Sources: 2025_LoL_esports_match_data_from_OraclesElixir.csv, 2026_LoL_esports_match_data_from_OraclesElixir.csv  
-Raw rows: 237,564; raw games: 19,797  
-Date range: 2025-01-11 11:11:24 -> 2026-10-18 19:48:36  
+Raw rows: 237,624; raw games: 19,802  
+Date range: 2025-01-11 11:11:24 -> 2026-10-22 16:09:25  
 Patch range: 15.01 -> 16.2 (43 patches)  
-Kept (complete + passing partial, in-scope): 9,496 games, 4,246 series, 94,960 player rows  
+Kept (complete + passing partial, in-scope): 9,501 games, 4,247 series, 95,010 player rows  
 Incomplete in-scope games: 949 (kept as passing partial: 949)  
 Series with a missing map (excluded from backtest): 11  
-Best-of inferred: {1: 1229, 3: 2294, 5: 723}
+Best-of inferred: {1: 1229, 3: 2294, 5: 724}
 
 ## Expected league codes
 
@@ -28,7 +28,7 @@ LTA N -> LCS, LTA North -> LCS, LTA S -> CBLOL, LTA South -> CBLOL
 | LPL | 1479 | 931 | 17748 | 1479 | 562 |  | True |
 | LCK | 1057 | 0 | 12684 | 1057 | 397 |  | True |
 | LCKC | 1033 | 0 | 12396 | 1033 | 386 |  | True |
-| EM | 958 | 0 | 11496 | 958 | 467 |  | True |
+| EM | 963 | 0 | 11556 | 963 | 468 |  | True |
 | LJL | 737 | 0 | 8844 | 737 | 596 |  | True |
 | LEC | 691 | 0 | 8292 | 691 | 329 |  | True |
 | LFL | 593 | 0 | 7116 | 593 | 360 |  | True |
