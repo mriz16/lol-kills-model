@@ -1,13 +1,13 @@
 # Data audit
 
 Sources: 2025_LoL_esports_match_data_from_OraclesElixir.csv, 2026_LoL_esports_match_data_from_OraclesElixir.csv  
-Raw rows: 237,624; raw games: 19,802  
-Date range: 2025-01-11 11:11:24 -> 2026-10-22 16:09:25  
+Raw rows: 237,636; raw games: 19,803  
+Date range: 2025-01-11 11:11:24 -> 2026-10-23 17:21:18  
 Patch range: 15.01 -> 16.2 (43 patches)  
-Kept (complete + passing partial, in-scope): 9,501 games, 4,247 series, 95,010 player rows  
+Kept (complete + passing partial, in-scope): 9,502 games, 4,248 series, 95,020 player rows  
 Incomplete in-scope games: 949 (kept as passing partial: 949)  
 Series with a missing map (excluded from backtest): 11  
-Best-of inferred: {1: 1229, 3: 2294, 5: 724}
+Best-of inferred: {1: 1230, 3: 2294, 5: 724}
 
 ## Expected league codes
 
@@ -41,7 +41,7 @@ LTA N -> LCS, LTA North -> LCS, LTA S -> CBLOL, LTA South -> CBLOL
 | LTA S | 222 | 0 | 2664 | 222 | 93 | CBLOL | True |
 | LTA N | 214 | 0 | 2568 | 214 | 93 | LCS | True |
 | MSI | 151 | 0 | 1812 | 151 | 39 |  | True |
-| WLDs | 130 | 12 | 1560 | 130 | 53 |  | True |
+| WLDs | 131 | 12 | 1572 | 131 | 54 |  | True |
 | FST | 80 | 0 | 960 | 80 | 26 |  | True |
 | LTA | 40 | 0 | 480 | 40 | 13 |  | True |
 | WLRQ | 6 | 6 | 72 | 6 | 6 |  | True |
@@ -110,7 +110,7 @@ Kept only if kills/deaths/assists/result/gamelength and playername are non-null 
 | MSI | 2025 | 10 | Anyone's Legend, Bilibili Gaming, CTBC Flying Oyster, FURIA, FlyQuest, G2 Esports, GAM Esports, Gen.G, Movistar KOI, T1 |
 | MSI | 2026 | 11 | Bilibili Gaming, Deep Cross Gaming, FURIA, G2 Esports, Hanwha Life Esports, Karmine Corp, LYON, T1, Team Liquid, Team Secret Whales, Top Esports |
 | WLDs | 2025 | 19 | 100 Thieves, Anyone's Legend, Bilibili Gaming, CTBC Flying Oyster, FlyQuest, Fnatic, G2 Esports, Gen.G, Hanwha Life Esports, Invictus Gaming, JD Gaming, KT Rolster, Movistar KOI, PSG Talon, T1, Team Secret Whales, Top Esports, Vivo Keyd Stars, Weibo Gaming |
-| WLDs | 2026 | 8 | Cloud9, FURIA, Invictus Gaming, JD Gaming, Karmine Corp, MVK Esports, Team WE, Top Esports |
+| WLDs | 2026 | 9 | Cloud9, FURIA, Gen.G, Invictus Gaming, JD Gaming, Karmine Corp, MVK Esports, Team WE, Top Esports |
 | WLRQ | 2026 | 8 | Bilibili Gaming Junior, EDG Youth Team, Ocean & Kimi Tournament Alliance, Top Esports Challenger, Weibo Gaming Youth Team, ZSK, 小爬虫, 我超威 |
 
 **Teams at international events with no domestic games in the data:** Bilibili Gaming Junior, EDG Youth Team, Ocean & Kimi Tournament Alliance, Team Secret, Top Esports Challenger, Weibo Gaming Youth Team, ZSK, 小爬虫, 我超威
