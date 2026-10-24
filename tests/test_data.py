@@ -189,3 +189,25 @@ def test_lcp_and_partial_worlds_games_kept(raw):
     text, _ = audit(r, players, teams)
     assert "## International events" in text
     assert "no domestic games in the data:** " in text
+
+
+def test_worlds_2026_labels_resolve():
+    """DFS / book spellings of the Worlds 2026 field (sponsor names, LØS)."""
+    from src.app.names import search_teams
+    known = ["Team Liquid", "Cloud9", "LYON", "MVK Esports", "MVK Esports Academy", "LØS",
+             "Los Ratones", "Colossal Gaming", "FURIA", "LOUD", "Dplus Kia",
+             "CTBC Flying Oyster", "Team Secret Whales", "Karmine Corp"]
+    cases = {"Team Liquid Alienware": "Team Liquid", "TL Alienware": "Team Liquid",
+             "TLA": "Team Liquid", "Cloud9 Kia": "Cloud9", "C9 Kia": "Cloud9",
+             "LYON": "LYON", "Lyon Gaming": "LYON", "MVK": "MVK Esports", "LOS": "LØS",
+             "LØS": "LØS", "Los Ratones": "Los Ratones", "FUR": "FURIA",
+             "CFO": "CTBC Flying Oyster", "TSW": "Team Secret Whales", "KC": "Karmine Corp"}
+    for label, want in cases.items():
+        assert resolve(label, known) == want, label
+        assert search_teams(label, known)[0] == want, label
+
+
+def test_normalize_transliterates():
+    from src.data.teams import normalize
+    assert normalize("LØS") == "los"
+    assert normalize("Ngựa Hí Esports") == "nguahiesports"

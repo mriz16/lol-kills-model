@@ -15,8 +15,9 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 ## Locked decisions (do not change without the user's sign-off)
 
 ### Data
-- Source: OE yearly match CSV from Google Drive, downloaded with `gdown` by
-  `scripts/refresh_data.py`. Keep `datacompleteness == "complete"`, plus **"partial"**
+- Source (changed 2026-10-24, user): the OE yearly match CSV (or a .zip of it) that the
+  user **uploads in the app** (`src/data/upload.py`). Google Drive / `gdown` are gone.
+  Keep `datacompleteness == "complete"`, plus **"partial"**
   games (`PARTIAL_OK_LEAGUES`: LPL signed off 2026-10-14, extended to every in-scope league
   2026-10-15 because partial Worlds play-in games were dropped) only if kills, deaths, assists, result
   and gamelength are non-null for all 10 players (and playername, needed for lineups) AND
@@ -25,20 +26,34 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
   carries a `partial` flag; the audit logs pass/fail counts per year. Split player rows
   (positions top/jng/mid/bot/sup) from team rows (`position == "team"`). Write compact
   parquet to `data/` (`players.parquet`, `teams.parquet`).
-- `.github/workflows/refresh.yml` runs the refresh 3x daily (03:17 / 11:17 / 19:17 UTC) and
-  commits updated parquet. Drive quota errors ("Too many users have viewed or downloaded")
-  are retried with backoff (60 / 180 / 420 s); finished years' CSVs are kept in the Actions
-  cache (`--cache-dir .oe_cache`) so a run downloads only the current year. Grading runs
-  even when the download fails. The app warns when the data ends >= 2 days ago.
-- The dev sandbox may block Google Drive: tests must never depend on it. Tests use the
-  synthetic OE-schema fixture in `tests/fixtures/`.
+- Upload: parsed with only `oe.REQUIRED_COLUMNS` and explicit dtypes (`upload.DTYPES`),
+  same rules (complete + passing partial, aliases, series inference, audit), merged into
+  the stored frames **by gameid** (uploaded games replace stored ones; nothing else is
+  dropped, so 2025 stays; series ids / patch ordinals are rebuilt over the union).
+  The app shows rows added, the new date range per league and the audit warnings.
+- Persistence: the merged parquet goes to the orphan **`data` branch** via the Git Data API
+  (`src/data/databranch.py`, same `[github]` token as the logs; one commit with
+  `data/players.parquet`, `data/teams.parquet`, `data/meta.json`, `reports/data_audit.md`).
+  Never commit data to `main` (it redeploys the app mid-slate). The app loads the latest
+  `data` commit on startup (head re-checked every 5 min), falls back to an unsaved upload
+  on local disk (`.data_cache/`), then to the parquet bundled in `main`. After an upload
+  every cached frame / store / sim is cleared and rebuilt without a restart.
+- `grade.yml` (3x daily) and `calibrate.yml` (weekly) read the parquet from the `data`
+  branch (`scripts/fetch_data_branch.sh`). The app warns when the data ends >= 2 days ago.
+- Tests never touch the network: they use the synthetic OE-schema fixture in
+  `tests/fixtures/` and in-memory fakes of the GitHub API.
 - Leagues (extended 2026-10-15 so every Worlds / MSI team has home-league data): domestic
   LCK, LPL, LEC, LCS, CBLOL (2025 `LTA S` aliased), LCP (Pacific: GAM, MVK, TSW, CFO, ...)
   + feeders LCKC, EM, LFL, VCS, LJL, PCS; international WLDs (Worlds), MSI, FST, EWC,
   LTA (2025 cross-conference), WLRQ. Out of scope: KeSPA Cup, second divisions. Config in
   `src/config.py`. The audit lists the teams at each international event and flags any
   without domestic games.
-- Team-name alias table + fuzzy matcher (`src/data/teams.py`).
+- Team-name alias table + fuzzy matcher (`src/data/teams.py`). `normalize` transliterates
+  (OE's "LØS" must match "LOS"); 2026 sponsor names (Team Liquid Alienware, Cloud9 Kia) are
+  aliased. `scripts/worlds_check.py` checks every Worlds label.
+- OE quirk: the LPL regional finals (late September) and the LCS EWC qualifier (April
+  2026) are filed under the international codes WLDs / EWC; `scripts/intl_report.py`
+  reports them separately. OE's `WLRQ` holds Chinese second-division teams.
 - OE has no series id; series are inferred from consecutive games of the same team pair
   (new series when game number resets or > 1 day gap). Best-of inferred as 2*max_wins-1.
 
@@ -109,18 +124,22 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 
 ## Layout
 ```
-scripts/refresh_data.py     download OE CSV(s) -> data/*.parquet
+scripts/refresh_data.py     local OE CSV / zip -> merged data/*.parquet (same pipeline as the app)
+scripts/fetch_data_branch.sh  data branch parquet -> a dir (workflows)
+scripts/worlds_check.py     Worlds labels, event env, thin samples -> reports/worlds_check.md
+scripts/intl_report.py      international-only backtest -> reports/backtest_intl.md
 scripts/make_synthetic.py   synthetic OE-schema data (fixture + backtest sandbox data)
 scripts/run_backtest.py     walk-forward backtest -> reports/
 src/config.py               leagues, priors, constants
-src/data/                   OE processing, series inference, team aliases, synthetic gen
+src/data/                   OE processing, upload parser + merge, data branch store,
+                            series inference, team aliases, synthetic gen
 src/engine/                 odds, history/features, sim, props/slips
 src/backtest/               elo, metrics, walk-forward runner
 src/engine/calibration.py   post-sim S (spread inflation), I (P(over) map), W (line shrinkage)
 src/backtest/calib_pipeline.py  walk-forward S/I/W pipeline, proxy lines, drift check
 src/app/                    app logic: names, odds_input, slate, ocr, picklog, slatelog, grading
 streamlit_app.py            Streamlit app (Phase 2)
-scripts/grade_picks.py      grade logs/picks.csv + logs/slates.csv on picks-log (refresh workflow)
+scripts/grade_picks.py      grade logs/picks.csv + logs/slates.csv on picks-log (grade.yml)
 scripts/spread_report.py    PIT / S / K / I / selection-bias study report
 scripts/refit_calibration.py  backtest + S/I/W refit -> data/calib_pairs, spread_rows, w_rows,
                             calib_params.json + reports/calibration_fit.md (calibrate.yml)
@@ -136,6 +155,8 @@ P off. `locked_config() == ALL_VARIANTS["L+O"]` (`LIVE_LOCKED` in walkforward.py
 uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
 
 ## Phase 2 app (`streamlit_app.py`, logic in `src/app/`)
+- Top of the page: "Data through" banner per in-scope league + the OE uploader
+  (`server.maxUploadSize = 600` MB in `.streamlit/config.toml`).
 - Tabs: Slate, Screenshot (beta), Results, Slip, Record. Mobile-first (centered layout).
 - Slate block: team search (alias table + fuzzy, `names.search_teams`), BO1/3/5,
   platform, league (auto: shared home league, else latest international event, else WLDs),
@@ -160,7 +181,7 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   weakest leg; payout and EV from the shown joint, calibrated and raw on tap.
 - Slate log (`slatelog`): every Run slate logs every line (played or not) with all model
   outputs to `logs/slates.csv` on `picks-log`; `played` flag set by logging a slip or
-  "Mark lines as played". Graded into `logs/slates_graded.csv` by the refresh workflow:
+  "Mark lines as played". Graded into `logs/slates_graded.csv` by `grade.yml`:
   the primary real-world evaluation set (Record tab, with the graded PrizePicks count
   toward 300 for `scripts/refit_w_real.py`; its `data/w_lambda_real.json` replaces the
   proxy-line lambda for cutoffs after its last slate).
@@ -175,16 +196,15 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   creates `picks-log` if missing).
 - Pick log: `picklog.GitHubStore` writes `logs/picks.csv` to branch `picks-log` via the
   contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
-  `refresh.yml` grades into `logs/graded.csv` on that branch; Record tab merges those
+  `grade.yml` grades into `logs/graded.csv` on that branch; Record tab merges those
   final grades with live grading (record, ROI, calibration of logged picks).
 - Caching: parquet via `st.cache_data`, `DataStore` via `st.cache_resource`, matchup
   pools + sims via `st.cache_data` keyed on the inputs. 5 matchups run in ~1 s.
 
 ## Phase 1.5 additions
-- `refresh.yml`: manual dispatch (optional `years` input), `OE_DRIVE_FOLDER_ID` from repo
-  variable `vars.OE_DRIVE_FOLDER_ID`, Python 3.11. Fails the job on HTML downloads, 0 rows,
-  missing OE columns, no in-scope games, or parquet > 50 MB. Writes `reports/data_audit.md`
-  (also printed to the log and the job summary) and commits it with the parquet.
+- (Superseded 2026-10-24 by the in-app upload: the Drive refresh workflow is removed.
+  Upload errors for a web page instead of CSV, 0 rows, missing OE columns or no in-scope
+  games; the audit is shown in the app and saved as `reports/data_audit.md` on `data`.)
 - Committed parquet is slim: only the columns in `PLAYER_KEEP` / `TEAM_KEEP` (`src/data/oe.py`).
 - `ci.yml`: pytest on Python 3.11 on every push / PR.
 - Upper-tail toggles on `EngineConfig`, all off by default; **A and B50 are locked** (via
@@ -251,5 +271,12 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
 - Spread study done (`reports/backtest_spread.md`): S locked and in the app, K rejected,
   I-beta + W display layers, MIN_EDGE 3 pts, slate log + backfill + grading, weekly
   calibration refit.
+- 2026-10-24: Google Drive dropped; data comes from the in-app OE upload, persisted to the
+  `data` branch (`src/data/upload.py`, `src/data/databranch.py`); workflows read it.
+- Worlds check (`reports/worlds_check.md`): all Worlds labels resolve (LOS -> LØS fixed),
+  no Swiss starter under 15 effective games (min 31), BO1 = Map 1, BO3 = Maps 1-2.
+  International backtest (`reports/backtest_intl.md`): L+O on Worlds 2025 + MSI 2026 +
+  FST 2026 (737 player-series) is not worse than domestic (crps_rel 0.282 vs 0.318, bias
+  -0.04 vs -0.04, ECE excess over its noise floor ~0.01 in both) -> no fix locked.
 - Open: refit W on real PrizePicks lines at 300 graded rows; residual bias -0.07
   (top -0.15).

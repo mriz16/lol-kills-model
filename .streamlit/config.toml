@@ -4,6 +4,8 @@ primaryColor = "#7c5cff"
 
 [server]
 runOnSave = false
+# Oracle's Elixir yearly CSV is uploaded in the app (a full year is ~150-400 MB unzipped).
+maxUploadSize = 600
 
 [browser]
 gatherUsageStats = false

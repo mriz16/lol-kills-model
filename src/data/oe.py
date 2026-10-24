@@ -8,22 +8,22 @@ import pandas as pd
 
 from src.config import LEAGUE_CODE_ALIASES, LEAGUES, PARTIAL_OK_LEAGUES, POSITIONS
 
+# Only the OE columns the pipeline reads (filter, partial check, series, engine, audit).
+# The app's uploader parses just these with explicit dtypes (src.data.upload).
 REQUIRED_COLUMNS = [
-    "gameid", "datacompleteness", "league", "year", "split", "playoffs", "date", "game",
-    "patch", "participantid", "side", "position", "playername", "playerid", "teamname",
-    "teamid", "champion", "gamelength", "result", "kills", "deaths", "assists",
-    "teamkills", "teamdeaths",
+    "gameid", "datacompleteness", "league", "year", "date", "game", "patch", "side",
+    "position", "playername", "teamname", "gamelength", "result", "kills", "deaths",
+    "assists", "teamkills", "teamdeaths",
 ]
 
 PLAYER_COLUMNS = [
-    "gameid", "league", "year", "split", "playoffs", "date", "game", "patch", "side",
-    "position", "playername", "playerid", "teamname", "teamid", "champion", "gamelength",
-    "result", "kills", "deaths", "assists", "teamkills", "teamdeaths", "partial",
+    "gameid", "league", "year", "date", "game", "patch", "side", "position", "playername",
+    "teamname", "gamelength", "result", "kills", "deaths", "assists", "teamkills",
+    "teamdeaths", "partial",
 ]
 TEAM_COLUMNS = [
-    "gameid", "league", "year", "split", "playoffs", "date", "game", "patch", "side",
-    "teamname", "teamid", "gamelength", "result", "kills", "deaths", "assists",
-    "teamkills", "teamdeaths", "partial",
+    "gameid", "league", "year", "date", "game", "patch", "side", "teamname", "gamelength",
+    "result", "kills", "deaths", "assists", "teamkills", "teamdeaths", "partial",
 ]
 
 
@@ -46,6 +46,14 @@ def patch_key(patch) -> tuple:
         # OE floats lose zero padding (14.1 == 14.10); treat minor as 2-digit decimal.
         return (int(major), int(round(float("0." + minor) * 100)))
     return tuple(int(x) for x in re.findall(r"\d+", s)) or (-1,)
+
+
+def normalize_patch(patch: pd.Series) -> pd.Series:
+    """OE patch values as the strings the parquet carries: numeric patches go through float
+    (a CSV parsed as text gives "15.10", parsed as numbers 15.1 -> "15.1"; both -> "15.1"),
+    anything else ("25.S1.1") is kept as is."""
+    num = pd.to_numeric(patch, errors="coerce")
+    return patch.astype(object).where(num.isna(), num.astype(str))
 
 
 def add_patch_ordinal(*frames: pd.DataFrame) -> None:
@@ -143,6 +151,7 @@ def filter_raw(raw: pd.DataFrame, leagues=LEAGUES) -> pd.DataFrame:
     df = raw[keep & raw["league"].isin(leagues)].copy()
     df["partial"] = df["datacompleteness"] != "complete"
     df = _fill_partial(df)
+    df["patch"] = normalize_patch(df["patch"])
     df["date"] = pd.to_datetime(df["date"])
     # Drop games that are not exactly 2 team rows + 10 player rows.
     counts = df.groupby("gameid")["position"].agg(

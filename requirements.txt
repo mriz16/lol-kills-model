@@ -2,7 +2,6 @@ pandas>=2.1
 numpy>=1.26
 pyarrow>=14
 scipy>=1.11
-gdown>=5.1
 rapidfuzz>=3.5
 pytest>=8
 streamlit>=1.50
