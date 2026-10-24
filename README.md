@@ -18,7 +18,7 @@ The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off.
 - The sims carry the locked spread inflation S. Probabilities shown in the app are
   calibrated (I, beta) and then shrunk toward the line (W: `p_line + λ (p_cal − p_line)`,
   λ per market). Calibrated-only and raw numbers are one tap away. A PLAY needs a shown
-  edge of at least 3 points. See `reports/backtest_spread.md` and
+  edge of at least 7 points. See `reports/backtest_spread.md` and
   `reports/calibration_fit.md`.
 - `.github/workflows/calibrate.yml`: runs weekly (Mondays 11:07 UTC) and on demand. It
   re-runs the walk-forward backtest and refits S / I / W (`scripts/refit_calibration.py`),

@@ -102,7 +102,8 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
 - **Display layers (not part of the distribution)**: I = beta calibration of P(over) per
   position x market (on the S pmfs), then W = `p_line + lambda (p_cal - p_line)` with
   p_line = (1 - P(push)) / 2, lambda per market fitted so the top-5 edges per slate are
-  calibrated. **K rejected.** Minimum shown (W) edge for a PLAY: **3 pts**.
+  calibrated. **K rejected.** Minimum shown (W) edge for a PLAY: **7 pts** (was 3; raised
+  2026-10-24 by the user to the weekly refit's derived minimum).
 
 ### Backtest (`src/backtest/`)
 - Walk-forward: each historical series is projected using ONLY prior data.
@@ -172,8 +173,8 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   platform; slip size for the breakeven is selectable (2-6, default 2). Probabilities and
   edges are **shown = W(I(model with S))** by default; "Calibrated" (I only) and "Raw"
   (sims with S) on a selector and in the tap-a-row explanation. PLAY = shown edge >=
-  `MIN_EDGE` (3 pts, `reports/calibration_fit.md`; never without calibration). All S / I /
-  W fits are as of the store's cutoff (backfill-safe). Flags: BELOW MIN (edge < 3 pts), THIN
+  `MIN_EDGE` (7 pts since 2026-10-24, `reports/calibration_fit.md`; never without calibration). All S / I /
+  W fits are as of the store's cutoff (backfill-safe). Flags: BELOW MIN (edge < 7 pts), THIN
   EDGE (uncalibrated only, < 3 pts), LOW SAMPLE (< 20 games in window), CAUTION ("less"
   with P(more) < 25% at a whole line). Side-balance warning when > 70% of a slate's plays
   (>= 3) are one side.
@@ -297,7 +298,7 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   (`reports/backtest_intl_E.md`).
 - No `picks-log` / `data` branch on GitHub as of 2026-10-24: logging and upload
   persistence have never reached GitHub (check the app's `[github]` secrets).
-- Weekly refit derives min edge 7 pts (top-1 se); app keeps the signed-off 3 pts pending
-  the user.
+- MIN_EDGE raised 3 -> 7 pts (user, 2026-10-24) = the weekly refit's derived minimum.
+  SUP MORE stays a warning only (user, 2026-10-24), no PLAY block.
 - Open: refit W on real PrizePicks lines at 300 graded rows; residual bias -0.07
   (top -0.15) was 2025 data (since 2026-03: +0.002).

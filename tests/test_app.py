@@ -137,8 +137,9 @@ def test_flags_goblin_safe_floor_sup_more():
         ["GOBLIN", "SAFE FLOOR"]
     assert flags_for("more", 0.30, 0.90, 1.5, 50, True, "sup", "goblin") == \
         ["GOBLIN", "SUP MORE"]
-    assert flags_for("more", 0.05, 0.62, 2.5, 50, True, "sup") == ["SUP MORE"]
-    assert flags_for("less", 0.05, 0.38, 2.5, 50, True, "sup") == []
+    assert flags_for("more", 0.10, 0.62, 2.5, 50, True, "sup") == ["SUP MORE"]
+    assert flags_for("less", 0.10, 0.38, 2.5, 50, True, "sup") == []
+    assert flags_for("less", 0.05, 0.38, 2.5, 50, True, "sup") == ["BELOW MIN"]
 
 
 def test_floors():

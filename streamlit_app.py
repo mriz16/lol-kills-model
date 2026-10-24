@@ -48,9 +48,11 @@ LOCAL_DATA = ROOT / ".data_cache"
 
 def _secret(section: str, key: str, default=None):
     try:
-        return st.secrets[section][key]
+        v = st.secrets[section][key]
     except Exception:
         return default
+    # a pasted token often carries spaces, a newline or an extra pair of quotes
+    return v.strip().strip("\"'").strip() if isinstance(v, str) else v
 
 
 @st.cache_resource
@@ -456,8 +458,8 @@ def screenshot_tab(store: DataStore):
 # ============================================================== results tab ====
 FLAG_HELP = {
     "BELOW MIN": f"shown (W-adjusted) edge under the {100 * MIN_EDGE:.0f}-point minimum: "
-                 "after W the top edges per slate still carry ~1 point of noise (se); "
-                 f"{100 * MIN_EDGE:.0f} points clears it by 2 se",
+                 "the weekly calibration refit's minimum: the best pick per slate is shown "
+                 "~3 points above its backtest hit rate, and the minimum clears that by 2 se",
     "THIN EDGE": f"edge under {100 * THIN_EDGE:.0f} points vs the per-leg breakeven "
                  "(uncalibrated: no minimum edge applied)",
     "LOW SAMPLE": "player has fewer than 20 games in the model window",

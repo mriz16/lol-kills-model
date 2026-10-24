@@ -40,10 +40,11 @@ W_PATH = C.DATA_DIR / "w_rows.parquet"
 W_REAL_PATH = C.DATA_DIR / "w_lambda_real.json"
 CALIB_MODEL = "L+O+S"
 CALIB_METHOD = "beta"
-# Minimum W-adjusted edge for a PLAY (reports/calibration_fit.md: after W the top-1/3/5
-# picks per slate are within ~1 pt of their shown P; 3 pts clears that by 2 se). Applies
-# only to calibrated probabilities.
-MIN_EDGE = 0.03
+# Minimum W-adjusted edge for a PLAY: 7 pts (user sign-off 2026-10-24), the weekly
+# refit's derived minimum (reports/calibration_fit.md: worst of -diff + 2 se over top-1/3/5
+# per slate; top-1 is shown 3.2 pts above its hit rate, se 1.7). Was 3 pts. Applies only
+# to calibrated probabilities.
+MIN_EDGE = 0.07
 SIDE_BALANCE = 0.70         # warn when > 70% of a slate's plays are one side
 SIDE_BALANCE_MIN_PLAYS = 3
 # Floors and goblins (reports/audit_unders.md). floorNN = the most kills the player reaches

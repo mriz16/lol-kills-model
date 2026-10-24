@@ -88,7 +88,7 @@ edges are smaller than the proxy ones. The *direction* of each finding is what c
 
 ## Open items for you
 
-1. **Minimum edge.** The weekly refit (`reports/calibration_fit.md`, 2026-10-19) now
+1. **Minimum edge (done 2026-10-24: raised to 7 pts).** The weekly refit (`reports/calibration_fit.md`, 2026-10-19) now
    derives **7 pts**. The app still uses the signed-off 3 pts. The 7 comes from the
    top-1-per-slate sample (n=470, gap -3.2 ± 1.7). Top-3 / top-5 need 3.6 / 3.1 pts.
    Raising `MIN_EDGE` needs your sign-off.
@@ -96,7 +96,7 @@ edges are smaller than the proxy ones. The *direction* of each finding is what c
    the `[github]` secrets on Streamlit Cloud, open Record → Log connection (it creates
    `picks-log`), then run every slate. At 300 graded lines, W is refit on real lines
    (`scripts/refit_w_real.py`).
-3. **Optional:** block ✅ PLAY on SUP MORE. Right now it is only a flag.
+3. SUP MORE stays a flag only (user, 2026-10-24).
 
 ## 6. Logging is not reaching GitHub
 
