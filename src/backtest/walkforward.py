@@ -61,6 +61,10 @@ for _d in (15, 20):
 LIVE_LOCKED_CFG = dict(**LOCKED_CFG, opp_by_outcome=True)
 for _n0 in (30, 100):
     ALL_VARIANTS[f"L+O+K{_n0}"] = EngineConfig(**LIVE_LOCKED_CFG, player_kappa_n0=_n0)
+# E (current-edition event env) on the live locked config: international events measured
+# over the last 30 / 45 days only (reports/audit_unders.md).
+for _d in (30, 45):
+    ALL_VARIANTS[f"L+O+E{_d}"] = EngineConfig(**LIVE_LOCKED_CFG, event_env_days=_d)
 SPREAD_VARIANTS = [LIVE_LOCKED, "L+O+K30", "L+O+K100"]
 PMF_MAX = 64               # stored pmf support 0..PMF_MAX-1 (last bin = PMF_MAX-1 or more)
 G_VARIANTS = {"L+G"}

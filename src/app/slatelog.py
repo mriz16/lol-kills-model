@@ -27,6 +27,7 @@ SLATE_COLUMNS = [
     "role", "line", "p_map", "calibrated", "side", "p_more", "p_less", "p_push", "p_side",
     "breakeven", "edge", "w_lambda", "cal_p_more", "cal_p_less", "cal_p_push", "cal_edge",
     "raw_side", "raw_p_more", "raw_p_less", "raw_p_push", "raw_edge", "k_spread", "mean", "median", "fair_line", "n_games", "share", "flags", "played",
+    "kind", "floor80", "floor90",
 ]
 SLATE_GRADED_COLUMNS = ["row_id", "status", "actual", "series_id", "graded_at"]
 
@@ -77,7 +78,8 @@ def make_slate_rows(results: pd.DataFrame, slate_date: str, backfill: bool, cuto
             mean=_r(r["mean"], 3),
             median=float(r["median"]), fair_line=float(r["fair_line"]),
             n_games=int(r["n_games"]), share=_r(r.get("share")), flags=r.get("flags", ""),
-            played=0,
+            played=0, kind=r.get("kind", "standard"), floor80=r.get("floor80"),
+            floor90=r.get("floor90"),
         ))
     return out
 
@@ -195,6 +197,8 @@ def graded_real_rows(slates: pd.DataFrame, graded: pd.DataFrame,
     d = slates.merge(graded[["row_id", "status", "actual"]], on="row_id", how="inner")
     d = d[(d["platform"] == platform) & d["status"].isin(["win", "loss", "push"])
           & d["actual"].notna()]
+    if "kind" in d:      # W is fitted on standard lines only (goblins / demons are not)
+        d = d[d["kind"].fillna("standard").isin(["standard", ""])]
     out = pd.DataFrame({"slate": d["slate_id"].astype(str),
                         "date": pd.to_datetime(d["slate_date"]),
                         "market": d["market"], "line": d["line"].astype(float), "y":

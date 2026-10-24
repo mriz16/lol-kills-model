@@ -144,6 +144,7 @@ scripts/spread_report.py    PIT / S / K / I / selection-bias study report
 scripts/refit_calibration.py  backtest + S/I/W refit -> data/calib_pairs, spread_rows, w_rows,
                             calib_params.json + reports/calibration_fit.md (calibrate.yml)
 scripts/refit_w_real.py     refit W's lambda on graded real PrizePicks lines (>= 300 rows)
+scripts/audit_unders.py     under-lean / floor / goblin audit -> reports/audit_unders_tables.md
 packages.txt                apt packages for Streamlit Cloud (tesseract-ocr)
 tests/                      pytest (fixture in tests/fixtures/)
 ```
@@ -198,6 +199,13 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
   `grade.yml` grades into `logs/graded.csv` on that branch; Record tab merges those
   final grades with live grading (record, ROI, calibration of logged picks).
+- Goblins / demons (2026-10-24): a trailing `g` / `goblin` or `d` / `demon` on a line
+  (`Chovy 7.5 g`) sets `LineMatch.kind`; those rows are MORE only, never PLAY (payout is
+  not the standard multiplier), excluded from the real-line W refit; the Slip tab takes a
+  payout override when a slip has one. Every row carries `floor80` / `floor90` (most
+  kills reached in 80% / 90% of sims, with S). Flags: GOBLIN / DEMON, SAFE FLOOR (shown
+  P(more) >= 85%, not a support), SUP MORE (support overs at PP-like lines hit 55.8% at a
+  shown 67.3%). Results tab: "Safest overs & floors" (rows by shown P(more)).
 - Caching: parquet via `st.cache_data`, `DataStore` via `st.cache_resource`, matchup
   pools + sims via `st.cache_data` keyed on the inputs. 5 matchups run in ~1 s.
 
@@ -278,5 +286,18 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   International backtest (`reports/backtest_intl.md`): L+O on Worlds 2025 + MSI 2026 +
   FST 2026 (737 player-series) is not worse than domestic (crps_rel 0.282 vs 0.318, bias
   -0.04 vs -0.04, ECE excess over its noise floor ~0.01 in both) -> no fix locked.
+- Under audit (`reports/audit_unders.md`, `scripts/audit_unders.py`, 2026-10-24): unders
+  are structural (lines at a player's trailing-10 average go under 54.7-56.7% with no
+  model: right skew); live-model bias since 2026-03 is +0.002 (se 0.03); at PP-like lines
+  shown PLAYs hit LESS 67.5% (shown 69.8%) vs MORE 63.4% (shown 68.2%), so overs are the
+  overstated side; support MORE loses. Lower tail calibrated within ~1 pt (supports 4
+  pts hot). Worlds 2026 runs 12.9 team kills vs the model's 14.6 env (2025 edition in
+  the event average) -> pro-over there. Toggle E `event_env_days` (current-edition event
+  env, 30 / 45 days, `L+O+E30/45`) REJECTED: MSI 2026 CRPS +0.083 (se 0.034)
+  (`reports/backtest_intl_E.md`).
+- No `picks-log` / `data` branch on GitHub as of 2026-10-24: logging and upload
+  persistence have never reached GitHub (check the app's `[github]` secrets).
+- Weekly refit derives min edge 7 pts (top-1 se); app keeps the signed-off 3 pts pending
+  the user.
 - Open: refit W on real PrizePicks lines at 300 graded rows; residual bias -0.07
-  (top -0.15).
+  (top -0.15) was 2025 data (since 2026-03: +0.002).

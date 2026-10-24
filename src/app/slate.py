@@ -46,6 +46,17 @@ CALIB_METHOD = "beta"
 MIN_EDGE = 0.03
 SIDE_BALANCE = 0.70         # warn when > 70% of a slate's plays are one side
 SIDE_BALANCE_MIN_PLAYS = 3
+# Floors and goblins (reports/audit_unders.md). floorNN = the most kills the player reaches
+# in NN% of sims (with S). In the walk-forward backtest P(X >= f) of the S pmfs is
+# calibrated to within ~1 pt from 80% to 98%, except supports (overstated 3-5 pts).
+FLOOR_QS = (0.80, 0.90)
+# SAFE FLOOR: shown P(more) >= 85%, not a support. At lines >= 2 kills under a PP-like
+# line the raw P(more) in 85-95% hit within 1-3 pts of its prediction; the shown (W) P is
+# lower than raw, so the flag is conservative there. Lines only 1 kill under the market
+# line ran ~7 pts hot (80% hit at a raw 87%): trust the flag on goblins 2+ kills under.
+SAFE_FLOOR_P = 0.85
+# SUP MORE: support overs at PP-like lines hit 55.8% at a shown 67.3% (n=267), below the
+# 2-pick breakeven; support unders were fine (68.2% at 70.5%).
 
 
 def per_leg_breakeven(platform: str, legs: int) -> float:
@@ -294,10 +305,13 @@ def run_matchup(store: DataStore, m: MatchupInput, legs: int, n_sims: int = C.N_
 
 # --------------------------------------------------------------------- prop rows ----
 def flags_for(side: str, edge: float, p_more: float, line: float, n_games: int,
-              calibrated: bool = False) -> list[str]:
+              calibrated: bool = False, role: str = "", kind: str = "standard") -> list[str]:
     """Calibrated: BELOW MIN under the minimum edge. Uncalibrated: THIN EDGE under 3 pts
-    (and never a PLAY: the minimum edge applies only after calibration)."""
+    (and never a PLAY: the minimum edge applies only after calibration). Goblin / demon
+    lines get their kind as a flag (MORE only, payout not in the edge)."""
     out = []
+    if kind != "standard":
+        out.append(kind.upper())
     if calibrated and edge < MIN_EDGE:
         out.append("BELOW MIN")
     elif not calibrated and edge < THIN_EDGE:
@@ -306,11 +320,26 @@ def flags_for(side: str, edge: float, p_more: float, line: float, n_games: int,
         out.append("LOW SAMPLE")
     if side == "less" and p_more < CAUTION_P_MORE and float(line).is_integer():
         out.append("CAUTION")
+    if p_more >= SAFE_FLOOR_P and role != "sup":
+        out.append("SAFE FLOOR")
+    if side == "more" and role == "sup":
+        out.append("SUP MORE")
     return out
 
 
-def _side(p_more: float, p_less: float) -> tuple[str, float]:
+def _side(p_more: float, p_less: float, kind: str = "standard") -> tuple[str, float]:
+    if kind != "standard":          # goblins / demons can only be played MORE
+        return "more", p_more
     return ("more", p_more) if p_more >= p_less else ("less", p_less)
+
+
+def floors(kills: np.ndarray, qs=FLOOR_QS) -> dict:
+    """{"floor80": f, ...}: the largest f with P(kills >= f) >= q."""
+    n = len(kills)
+    counts = np.bincount(np.asarray(kills, dtype=np.int64))
+    at_least = 1.0 - np.concatenate([[0.0], np.cumsum(counts)[:-1]]) / n   # P(X >= f)
+    return {f"floor{int(round(100 * q))}": int(np.nonzero(at_least >= q - 1e-12)[0].max())
+            for q in qs}
 
 
 def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
@@ -325,9 +354,10 @@ def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
     lam = lambda_for(w_lambda, m.market) if is_cal else 1.0
     w_more, w_less = w_adjust(cal["p_over"], cal["p_under"], cal["p_push"], lam)
     be = per_leg_breakeven(m.platform, legs)
-    raw_side, raw_p = _side(s["p_over"], s["p_under"])
-    cal_side, cal_p = _side(cal["p_over"], cal["p_under"])
-    side, p_side = _side(float(w_more), float(w_less))
+    kind = getattr(lm, "kind", "standard")
+    raw_side, raw_p = _side(s["p_over"], s["p_under"], kind)
+    cal_side, cal_p = _side(cal["p_over"], cal["p_under"], kind)
+    side, p_side = _side(float(w_more), float(w_less), kind)
     side_idx, j = sim.player_index(lm.player)
     share, n_games = res.params.info.get(f"share_{side_idx}_{j}", (np.nan, 0))
     opp = m.team_b if lm.team == m.team_a else m.team_a
@@ -344,10 +374,12 @@ def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
         cal_p_side=cal_p, cal_edge=cal_p - be, raw_side=raw_side, raw_p_more=s["p_over"],
         raw_p_less=s["p_under"], raw_p_push=s["p_push"], raw_p_side=raw_p,
         raw_edge=raw_p - be, n_games=int(n_games), share=float(share), p_map=p_map,
+        kind=kind, **floors(kills),
     )
-    row["play"] = bool(is_cal and row["edge"] >= MIN_EDGE)
+    # goblin / demon payouts are not the standard multiplier: never a PLAY on this edge
+    row["play"] = bool(is_cal and row["edge"] >= MIN_EDGE and kind == "standard")
     row["flags"] = " ".join(flags_for(side, row["edge"], row["p_more"], row["line"], n_games,
-                                      is_cal))
+                                      is_cal, lm.role, kind))
     row["why"] = explain(res, lm, row)
     return row
 
@@ -398,6 +430,14 @@ def results_table(results: list[MatchupResult]) -> pd.DataFrame:
     return df
 
 
+def safest_overs(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+    """Rows by shown P(more), highest first (goblins included): the slate's safest overs.
+    Supports are kept but carry SUP MORE (their overs ran hot in the backtest)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df.sort_values("p_more", ascending=False).head(n).reset_index(drop=True)
+
+
 def rebreakeven(df: pd.DataFrame, legs: int) -> pd.DataFrame:
     """Recompute breakeven / edge / flags for a different slip size (no re-sim)."""
     if df.empty:
@@ -407,10 +447,12 @@ def rebreakeven(df: pd.DataFrame, legs: int) -> pd.DataFrame:
     df["edge"] = df["p_side"] - df["breakeven"]
     df["raw_edge"] = df["raw_p_side"] - df["breakeven"]
     df["cal_edge"] = df["cal_p_side"] - df["breakeven"]
-    df["play"] = df["calibrated"].astype(bool) & (df["edge"] >= MIN_EDGE)
+    kind = df["kind"] if "kind" in df else pd.Series("standard", index=df.index)
+    df["play"] = df["calibrated"].astype(bool) & (df["edge"] >= MIN_EDGE) & \
+        (kind == "standard")
     df["flags"] = [" ".join(flags_for(r.side, r.edge, r.p_more, r.line, r.n_games,
-                                      bool(r.calibrated)))
-                   for r in df.itertuples()]
+                                      bool(r.calibrated), r.role, k))
+                   for r, k in zip(df.itertuples(), kind)]
     return df.sort_values("edge", ascending=False).reset_index(drop=True)
 
 
@@ -431,17 +473,19 @@ def side_balance(df: pd.DataFrame) -> dict | None:
 
 
 # --------------------------------------------------------------------- slips ----
-def slip_summary(sims: dict[str, SeriesSim], picks: list[dict], platform: str) -> dict:
+def slip_summary(sims: dict[str, SeriesSim], picks: list[dict], platform: str,
+                 payout: float | None = None) -> dict:
     """picks: [{matchup, player, market, line, side ('more'|'less')}].
 
     Joint probability from shared sims within a matchup, multiplied across matchups.
+    payout overrides the platform's multiplier (goblin / demon legs change it).
     """
     legs = [Leg(p["matchup"], p["player"], p["market"], float(p["line"]),
                 "over" if p["side"] == "more" else "under") for p in picks]
     sp = slip_probability(sims, legs)
     n = len(legs)
     table = PLATFORMS[platform]
-    mult = table.get(n)
+    mult = payout if payout else table.get(n)
     # Shown (W) and calibrated joints: the shared-sim joint scaled by each leg's shown (or
     # calibrated) / raw P, which keeps the within-matchup correlation of the sims; capped
     # at the weakest leg.
