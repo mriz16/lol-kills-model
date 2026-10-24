@@ -64,7 +64,12 @@ def search_teams(query: str, known: list[str], k: int = 6) -> list[str]:
 
 
 # ------------------------------------------------------------------------- lines ----
-LINE_RE = re.compile(r"^\s*(?P<name>.+?)[\s,:;=\t]+(?P<line>\d+(?:\.\d+)?)\s*$")
+LINE_RE = re.compile(r"^\s*(?P<name>.+?)[\s,:;=\t]+(?P<line>\d+(?:\.\d+)?)"
+                     r"(?:\s*(?P<tag>goblin|gob|g|demon|dem|d))?\s*$", flags=re.I)
+# PrizePicks goblin (lowered line, reduced payout) / demon (raised line, boosted payout):
+# MORE only. Tag a line with a trailing "g" / "goblin" or "d" / "demon".
+KINDS = {"g": "goblin", "gob": "goblin", "goblin": "goblin",
+         "d": "demon", "dem": "demon", "demon": "demon"}
 
 
 @dataclass
@@ -77,6 +82,7 @@ class LineMatch:
     team: str | None = None
     role: str | None = None
     candidates: list = field(default_factory=list)  # [(player, team, role, score)]
+    kind: str = "standard"       # "standard" | "goblin" | "demon"
 
     @property
     def ok(self) -> bool:
@@ -84,11 +90,18 @@ class LineMatch:
 
 
 def parse_line(text: str) -> tuple[str, float] | None:
-    """'Loki 10.5' -> ('Loki', 10.5). Accepts 'Loki: 10.5', 'Loki, 10.5', tabs."""
+    """'Loki 10.5' -> ('Loki', 10.5). Accepts 'Loki: 10.5', 'Loki, 10.5', tabs, and a
+    trailing goblin / demon tag ('Loki 6.5 g'; the kind comes from parse_kind)."""
     m = LINE_RE.match(text)
     if not m:
         return None
     return m.group("name").strip(), float(m.group("line"))
+
+
+def parse_kind(text: str) -> str:
+    m = LINE_RE.match(text)
+    tag = (m.group("tag") or "").lower() if m else ""
+    return KINDS.get(tag, "standard")
 
 
 def match_player(query: str, roster: list[dict]) -> tuple[str, list]:
@@ -141,16 +154,18 @@ def match_lines(text: str, roster: list[dict]) -> list[LineMatch]:
             continue
         name, line = parsed
         status, cands = match_player(name, roster)
-        lm = LineMatch(raw=raw, query=name, line=line, status=status, candidates=cands)
+        lm = LineMatch(raw=raw, query=name, line=line, status=status, candidates=cands,
+                       kind=parse_kind(raw))
         if status == "ok":
             lm.player, lm.team, lm.role = cands[0][0], cands[0][1], cands[0][2]
         out.append(lm)
-    # The same player twice is almost always a typo: flag the later copies.
+    # The same player twice at the same kind of line is almost always a typo: flag the
+    # later copies (a standard line plus a goblin / demon line is fine).
     seen = set()
     for lm in out:
         if lm.ok:
-            if lm.player in seen:
+            if (lm.player, lm.kind) in seen:
                 lm.status = "ambiguous"
                 lm.candidates = [(lm.player, lm.team, lm.role, 100.0)]
-            seen.add(lm.player)
+            seen.add((lm.player, lm.kind))
     return out

@@ -9,12 +9,12 @@ import pytest
 
 from src import config as C
 from src.app import grading, picklog
-from src.app.names import match_lines, match_player, parse_line, search_teams
+from src.app.names import match_lines, match_player, parse_kind, parse_line, search_teams
 from src.app.ocr import parse_board_text, props_to_lines
 from src.app.odds_input import odds_summary, parse_american
-from src.app.slate import (DataStore, MatchupInput, check_matchup, flags_for,
+from src.app.slate import (DataStore, MatchupInput, check_matchup, flags_for, floors,
                            per_leg_breakeven, rebreakeven, results_table, run_matchup,
-                           slip_summary)
+                           safest_overs, slip_summary)
 from src.engine.odds import series_win_prob
 
 ROSTER = [
@@ -34,6 +34,16 @@ def test_parse_line_formats():
     assert parse_line("Hans Sama: 5.5") == ("Hans Sama", 5.5)
     assert parse_line("Faker,\t7") == ("Faker", 7.0)
     assert parse_line("Faker") is None
+
+
+def test_parse_goblin_demon_tags():
+    assert parse_line("Chovy 7.5 g") == ("Chovy", 7.5)
+    assert [parse_kind(t) for t in ("Chovy 7.5", "Chovy 7.5 g", "Chovy 7.5goblin",
+                                    "Chovy 12.5 D", "Hans Sama: 5.5 demon")] == \
+        ["standard", "goblin", "goblin", "demon", "demon"]
+    out = match_lines("Chovy 10.5\nChovy 7.5 g\nChovy 8.5 g", ROSTER)
+    assert [(m.status, m.kind) for m in out] == [("ok", "standard"), ("ok", "goblin"),
+                                                 ("ambiguous", "goblin")]
 
 
 def test_match_player_exact_prefix_fuzzy():
@@ -120,6 +130,21 @@ def test_flags():
     assert flags_for("less", 0.10, 0.20, 7.0, 50) == ["CAUTION"]
     assert flags_for("less", 0.10, 0.20, 7.5, 50) == []      # half-point line
     assert flags_for("less", 0.10, 0.30, 7.0, 50) == []      # P(more) >= 25%
+
+
+def test_flags_goblin_safe_floor_sup_more():
+    assert flags_for("more", 0.30, 0.90, 4.5, 50, True, "mid", "goblin") == \
+        ["GOBLIN", "SAFE FLOOR"]
+    assert flags_for("more", 0.30, 0.90, 1.5, 50, True, "sup", "goblin") == \
+        ["GOBLIN", "SUP MORE"]
+    assert flags_for("more", 0.05, 0.62, 2.5, 50, True, "sup") == ["SUP MORE"]
+    assert flags_for("less", 0.05, 0.38, 2.5, 50, True, "sup") == []
+
+
+def test_floors():
+    k = np.repeat(np.arange(10), 10)            # uniform 0..9
+    assert floors(k) == {"floor80": 2, "floor90": 1}
+    assert floors(np.full(50, 4)) == {"floor80": 4, "floor90": 4}
 
 
 # ------------------------------------------------------------------ OCR parser ----
@@ -322,6 +347,22 @@ def test_run_matchup_on_fixture(store):
     legs = [dict(r) for _, r in df.head(2).iterrows()]
     s = slip_summary({res.inp.key: res.sim}, legs, "PrizePicks")
     assert s["payout"] == 3.0 and s["ev"] == pytest.approx(s["p_joint"] * 3 - 1)
+
+
+def test_goblin_rows_more_only_never_play(store):
+    a, b = "LCK Tigers", "LCK Ravens"
+    pl = store.default_lineup(a)[2]
+    m = MatchupInput(a, b, 3, "PrizePicks", "-150", "+125",
+                     lines=f"{pl} 30.5\n{pl} 0.5 g")
+    df = results_table([run_matchup(store, m, legs=2, n_sims=4000)])
+    std, gob = df[df["kind"] == "standard"].iloc[0], df[df["kind"] == "goblin"].iloc[0]
+    assert std["side"] == "less" and gob["side"] == "more" and not gob["play"]
+    assert "GOBLIN" in gob["flags"] and gob["floor90"] <= gob["floor80"] <= gob["median"]
+    assert not rebreakeven(df, 3)["play"][df["kind"] == "goblin"].any()
+    assert safest_overs(df).iloc[0]["kind"] == "goblin"
+    legs = [dict(gob, side="more")]
+    sims = {m.key: run_matchup(store, m, legs=2, n_sims=4000).sim}
+    assert slip_summary(sims, legs * 2, "PrizePicks", payout=2.0)["payout"] == 2.0
 
 
 def test_check_matchup_reports_bad_names(store):

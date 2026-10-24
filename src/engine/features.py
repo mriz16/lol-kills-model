@@ -53,6 +53,11 @@ class EngineConfig:
     #    method-of-moments kappa from the player's own prior games, shrunk toward the position
     #    kappa on the overdispersion scale rho = 1/(1+kappa) by n / (n + player_kappa_n0).
     player_kappa_n0: float = 0.0       # 0 = off
+    # E) current-edition event env: an international event's measured env uses only that
+    #    code's games in the last N days (this edition) instead of its latest 120 games,
+    #    which carry last year's edition. Same min(1, n/40) blend with the home-league
+    #    prior. 0 = off (see reports/audit_unders.md).
+    event_env_days: int = 0
 
 
 def locked_config(**overrides) -> EngineConfig:
@@ -192,11 +197,26 @@ class History:
         home_env = np.mean([envs.get(h, envs["_global"]) if h else envs["_global"]
                             for h in homes])
         prior = home_env * C.EVENT_ENV_PRIOR.get(league, 1.0)
-        m, n = self.measured_env(league, cutoff, patch, cfg)
+        if cfg.event_env_days > 0:
+            m, n = self.edition_env(league, cutoff, cfg.event_env_days)
+        else:
+            m, n = self.measured_env(league, cutoff, patch, cfg)
         if n == 0:
             return float(prior)
         wt = min(1.0, n / C.EVENT_ENV_FULL_WEIGHT_GAMES)
         return float(wt * m + (1 - wt) * prior)
+
+    def edition_env(self, league, cutoff, days):
+        """Toggle E: (avg team kills per map, n games) of `league` over the `days` before
+        cutoff (the current edition of an international event)."""
+        idx = self.league_idx.get(league)
+        if idx is None:
+            return np.nan, 0
+        idx = self._prior(idx, self.t_time, cutoff)
+        idx = idx[self.t_time[idx] >= cutoff - int(pd.Timedelta(days=days).value)]
+        if len(idx) == 0:
+            return np.nan, 0
+        return float(self.t_kills[idx].mean()), len(idx) // 2
 
     def recent_patch_env(self, idx, n_patches, min_games=C.DRIFT_MIN_GAMES):
         """Plain team kills/game over the latest n patches present in rows idx (extended

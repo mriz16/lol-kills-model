@@ -24,10 +24,10 @@ from src.data import databranch  # noqa: E402
 from src.data.upload import UploadError, process_upload  # noqa: E402
 from src.app.names import search_teams  # noqa: E402
 from src.app.ocr import ocr_image, parse_board_text, props_to_lines  # noqa: E402
-from src.app.slate import (MARKET_BY_FORMAT, MIN_EDGE, PLATFORMS, THIN_EDGE,  # noqa: E402
-                           DataStore, MatchupInput, check_matchup, lineups_for,
+from src.app.slate import (MARKET_BY_FORMAT, MIN_EDGE, PLATFORMS, SAFE_FLOOR_P,  # noqa: E402
+                           THIN_EDGE, DataStore, MatchupInput, check_matchup, lineups_for,
                            per_leg_breakeven, rebreakeven, results_table, run_matchup,
-                           side_balance, slip_summary)
+                           safest_overs, side_balance, slip_summary)
 from src.engine.features import build_matchup  # noqa: E402
 from src.engine.sim import SeriesSim, simulate_series  # noqa: E402
 
@@ -329,13 +329,16 @@ def render_block(store: DataStore, bid: int, n: int):
                        f"{pct(odds['p_map_a'])} / {pct(odds['p_map_b'])} (from {src})")
 
         st.text_area(f"Lines ({m.market}): one per line, \"player line\"", key=f"lines_{bid}",
-                     placeholder="Chovy 10.5\nCanyon 8.5", height=140)
+                     placeholder="Chovy 10.5\nCanyon 8.5\nChovy 7.5 g", height=140,
+                     help="Add \"g\" after a goblin line and \"d\" after a demon line "
+                          "(MORE only). A player can have a standard and a goblin line.")
         if lines:
             ok = [lm for lm in lines if lm.ok]
             bad = [lm for lm in lines if not lm.ok]
             if ok:
                 st.caption("Matched: " + " · ".join(
-                    f"{lm.player} ({lm.team}, {lm.role}) {lm.line:g}" for lm in ok))
+                    f"{lm.player} ({lm.team}, {lm.role}) {lm.line:g}"
+                    + ("" if lm.kind == "standard" else f" {lm.kind}") for lm in ok))
             for lm in bad:
                 cands = ", ".join(f"{c[0]} ({c[1]}, {c[2]})" for c in lm.candidates[:3])
                 if lm.status == "bad line":
@@ -460,6 +463,20 @@ FLAG_HELP = {
     "LOW SAMPLE": "player has fewer than 20 games in the model window",
     "CAUTION": "'less' at a whole-number line with P(more) < 25%: in the backtest those "
                "overs hit about 9 points more often than predicted",
+    "GOBLIN": "goblin line: MORE only, and PrizePicks pays less than the standard power "
+              "multiplier, so the edge shown (vs the standard breakeven) is too high and it "
+              "is never a PLAY. Judge it on P(more) and the floor; set the real payout in "
+              "the Slip tab",
+    "DEMON": "demon line: MORE only, boosted payout not in the edge (never a PLAY). Set "
+             "the real payout in the Slip tab",
+    "SAFE FLOOR": f"shown P(more) ≥ {100 * SAFE_FLOOR_P:.0f}% (not a support): in the "
+                  "backtest P(more) at lines 2+ kills under the market line was calibrated "
+                  "within 1-3 pts at 85-95%, and the shown P sits below the raw model. A "
+                  "goblin only 1 kill under the standard line ran ~7 pts hot: trust the "
+                  "flag on goblins 2+ kills under",
+    "SUP MORE": "support MORE: at PrizePicks-like lines support overs hit 55.8% when "
+                "shown at 67.3% (backtest, n=267), below the 2-pick breakeven. Skip unless "
+                "it is a deep goblin",
 }
 
 
@@ -497,8 +514,12 @@ def results_tab():
         "line": df["line"], "pick": df[f"{pre}side"].str.upper(),
         "edge": 100 * df[f"{pre}edge"], "P(more)": 100 * df[f"{pre}p_more"],
         "P(less)": 100 * df[f"{pre}p_less"], "P(push)": 100 * df[f"{pre}p_push"],
-        "mean": df["mean"], "fair": df["fair_line"], "flags": df["flags"],
+        "mean": df["mean"], "fair": df["fair_line"],
+        "floor80": df["floor80"], "floor90": df["floor90"], "flags": df["flags"],
     })
+    if "kind" in df:
+        view["line"] = [f"{l:g}" + ("" if k == "standard" else f" {k[0].upper()}")
+                        for l, k in zip(df["line"], df["kind"])]
     st.caption({"": f"Shown probabilities (calibrated + W). ✅ = shown edge ≥ "
                     f"{100 * MIN_EDGE:.0f} pts.",
                 "cal_": "Calibrated (I) probabilities, before W. ✅ / flags follow Shown.",
@@ -512,8 +533,11 @@ def results_tab():
         column_config={"edge": st.column_config.NumberColumn("edge", format="%+.1f%%"),
                        "P(more)": pc, "P(less)": pc, "P(push)": pc,
                        "mean": st.column_config.NumberColumn(format="%.2f"),
-                       "line": st.column_config.NumberColumn(format="%g"),
-                       "fair": st.column_config.NumberColumn(format="%g")})
+                       "fair": st.column_config.NumberColumn(format="%g"),
+                       "floor80": st.column_config.NumberColumn(
+                           "floor 80", help="kills reached in 80% of sims"),
+                       "floor90": st.column_config.NumberColumn(
+                           "floor 90", help="kills reached in 90% of sims")})
     rows = ev.selection.rows if ev and ev.selection else []
     if rows:
         r = df.iloc[rows[0]]
@@ -524,7 +548,33 @@ def results_tab():
             st.caption(f"{f}: {FLAG_HELP[f]}")
     else:
         st.caption("Tap a row to see why (raw and calibrated probabilities).")
+    safest_overs_ui(df)
     mark_played_ui(df)
+
+
+def safest_overs_ui(df: pd.DataFrame):
+    """The slate's overs ranked by shown P(more), with each player's floor."""
+    top = safest_overs(df)
+    if top.empty:
+        return
+    with st.expander("Safest overs & floors", expanded=False):
+        st.caption("Every line ranked by shown P(more), goblins included. floor 80 / 90 = "
+                   "kills the player reaches in 80% / 90% of this matchup's sims (series "
+                   "length, win odds and opponent included). A goblin line below floor 90 "
+                   "(3.5 with floor 90 = 4) hits in 90%+ of sims. SAFE FLOOR = shown P(more) ≥ "
+                   f"{100 * SAFE_FLOOR_P:.0f}%; supports never get it (their floors ran "
+                   "3-5 pts hot in the backtest).")
+        st.dataframe(pd.DataFrame({
+            "player": top["player"], "role": top["role"],
+            "line": [f"{l:g}" + ("" if k == "standard" else f" {k}")
+                     for l, k in zip(top["line"], top.get("kind", ["standard"] * len(top)))],
+            "P(more)": 100 * top["p_more"], "floor 90": top["floor90"],
+            "floor 80": top["floor80"], "median": top["median"], "mean": top["mean"],
+            "flags": top["flags"],
+        }), hide_index=True, width="stretch",
+            column_config={"P(more)": st.column_config.NumberColumn(format="%.1f%%"),
+                           "mean": st.column_config.NumberColumn(format="%.2f"),
+                           "median": st.column_config.NumberColumn(format="%g")})
 
 
 def mark_played_ui(df: pd.DataFrame):
@@ -544,6 +594,8 @@ def leg_options(df: pd.DataFrame) -> dict[str, dict]:
     for side_first in (True, False):
         for r in df.itertuples():
             side = r.side if side_first else ("less" if r.side == "more" else "more")
+            if side == "less" and getattr(r, "kind", "standard") != "standard":
+                continue                        # goblins / demons are MORE only
             p = r.p_more if side == "more" else r.p_less
             label = f"{r.player} {side.upper()} {r.line:g} · {p:.0%} ({r.matchup})"
             opts[label] = dict(r._asdict(), side=side, p_side=p)
@@ -568,7 +620,18 @@ def slip_tab():
     default = legs[0]["platform"]
     platform = st.radio("Platform", list(PLATFORMS), horizontal=True,
                         index=list(PLATFORMS).index(default), key="slip_platform")
-    s = slip_summary(ss()["sims"], legs, platform)
+    special = [l for l in legs if l.get("kind", "standard") != "standard"]
+    payout = None
+    if special:
+        std = PLATFORMS[platform].get(len(legs))
+        payout = st.number_input(
+            "Payout (x) shown by PrizePicks for this slip", min_value=1.0,
+            value=float(std or 3.0), step=0.25, key="slip_payout",
+            help="Goblin legs lower the payout, demon legs raise it. Enter the multiplier "
+                 "PrizePicks shows for this exact slip; EV uses it.")
+        st.caption(f"{len(special)} goblin / demon leg(s): EV uses the payout above, not "
+                   f"the standard {std:g}x." if std else "")
+    s = slip_summary(ss()["sims"], legs, platform, payout)
     c1, c2, c3 = st.columns(3)
     c1.metric("Joint P", pct(s["p_joint"]))
     c2.metric("Payout", f"{s['payout']:g}x" if s["payout"] else "–")
