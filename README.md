@@ -8,8 +8,13 @@ The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off.
 - `streamlit_app.py`: the phone-first app (Slate, Screenshot, Results, Slip, Record tabs)
 - `src/engine/`: the simulator. `src/app/`: app logic (names, odds input, slate, OCR, pick
   log, grading).
-- `.github/workflows/refresh.yml`: runs daily. It refreshes `data/*.parquet` on `main`,
-  then grades logged picks and the slate log on the `picks-log` branch.
+- Match data: you upload the Oracle's Elixir yearly CSV (or a .zip of it) at the top of
+  the app. It is merged by `gameid` into the stored data and saved as parquet to the
+  **`data`** branch through the GitHub API (never `main`, so an upload does not redeploy
+  the app mid-slate). The app loads the latest `data` commit on startup. See "Updating the
+  match data" below.
+- `.github/workflows/grade.yml`: runs three times a day. It grades logged picks and the
+  slate log on the `picks-log` branch against the `data` branch parquet.
 - The sims carry the locked spread inflation S. Probabilities shown in the app are
   calibrated (I, beta) and then shrunk toward the line (W: `p_line + λ (p_cal − p_line)`,
   λ per market). Calibrated-only and raw numbers are one tap away. A PLAY needs a shown
@@ -27,12 +32,13 @@ The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off.
 
 ### 1. Put the app on `main`
 Merge the Phase 2 branch into `main`. The app deploys from `main`. Each daily data commit
-to `main` redeploys it with fresh data.
+to `main` redeploys it; data uploads go to the `data` branch and do not.
 
-### 2. Create a fine-grained GitHub token (for the pick log)
-Streamlit Cloud's disk is wiped on every restart. So the app stores your pick log as
-`logs/picks.csv` on a separate **`picks-log`** branch, through the GitHub API. Using a
-separate branch means a logged pick never redeploys the app.
+### 2. Create a fine-grained GitHub token (for the data and the pick log)
+Streamlit Cloud's disk is wiped on every restart. So the app stores uploaded match data on
+a **`data`** branch and your pick log as `logs/picks.csv` on a separate **`picks-log`**
+branch, through the GitHub API. Using separate branches means an upload or a logged pick
+never redeploys the app.
 
 1. GitHub → your avatar → **Settings** → **Developer settings** → **Personal access tokens**
    → **Fine-grained tokens** → **Generate new token**.
@@ -58,6 +64,7 @@ separate branch means a logged pick never redeploys the app.
      token = "github_pat_..."
      repo = "mriz16/lol-kills-model"
      branch = "picks-log"
+     data_branch = "data"
      ```
 6. Click **Deploy**. The first build installs `requirements.txt` plus `tesseract-ocr` from
    `packages.txt`, which takes a few minutes.
@@ -74,10 +81,32 @@ Open the app URL and use the browser's **Add to Home Screen**.
 On share.streamlit.io, open the app's **⋮** menu → **Settings** → **Secrets**, edit the
 values and save. The app restarts with the new values.
 
+### Updating the match data
+1. Download the current year's file from Oracle's Elixir
+   (`2026_LoL_esports_match_data_from_OraclesElixir.csv`; zipping it first makes the upload
+   much faster on a phone).
+2. In the app, the banner at the top shows "Data through" per league. Use the uploader
+   under it, then press **Merge into data**.
+3. The app parses only the columns the model needs, applies the same rules as always
+   (complete games + partial games that pass the kill checks, league aliases, series
+   inference, audit), and merges by `gameid`: games in the file replace the stored ones,
+   every other stored game (all of 2025 included) is kept. It shows the games added, the
+   new date range per league, and the audit's warnings.
+4. The merged parquet is committed to the `data` branch (`data/players.parquet`,
+   `data/teams.parquet`, `data/meta.json`, `reports/data_audit.md`). The team pools are
+   rebuilt right away, without a restart. Other open sessions pick up the new data within
+   5 minutes.
+
+Without GitHub secrets, or if the save fails, the merged data stays on the server's disk
+until the next restart, and the app says so. Uploads up to 600 MB are accepted
+(`.streamlit/config.toml`). Locally, `python scripts/refresh_data.py --csv FILE` runs the
+same pipeline into `data/`.
+
 ### Pick-log grading
-The `refresh-data` workflow runs three times a day (03:17, 11:17, 19:17 UTC; Google Drive sometimes throttles OE's files with "Too many users have viewed or downloaded this file recently", so each run retries with backoff and a blocked run is retried by the next one; last year's CSV is kept in the Actions cache), or on demand from Actions → refresh-data →
-Run workflow. After refreshing the data, it checks out `picks-log`, grades every pending
-pick against the new OE data, and commits `logs/graded.csv`. It needs no extra secret; it
+The `grade-picks` workflow runs three times a day (03:17, 11:17, 19:17 UTC), or on demand
+from Actions → grade-picks → Run workflow. It copies the parquet from the `data` branch
+(falling back to the parquet in `main` if nothing was uploaded yet), checks out
+`picks-log`, grades every pending pick, and commits `logs/graded.csv`. It needs no extra secret; it
 uses the workflow's own `GITHUB_TOKEN`. The Record tab also grades pending picks live from
 the app's data, so results show up as soon as the data has them.
 
@@ -132,7 +161,11 @@ Without secrets, the pick log is written to `logs/` on local disk (git-ignored).
 ## Data and backtest
 
 ```bash
-python scripts/refresh_data.py             # OE CSVs from Google Drive -> data/*.parquet
+python scripts/refresh_data.py --csv 2026_LoL_esports_match_data_from_OraclesElixir.csv
+                                           # local OE CSV / .zip -> merged into data/*.parquet
+scripts/fetch_data_branch.sh data_branch   # the app's uploaded parquet -> data_branch/
+python scripts/worlds_check.py             # Worlds labels / env / thin samples -> reports/
+python scripts/intl_report.py              # international-event backtest -> reports/
 python scripts/run_backtest.py --quick     # walk-forward backtest -> reports/
 python scripts/refit_calibration.py        # backtest + S/I/W refit -> data/calib_*, w_rows
 # spread / calibration study (report only)

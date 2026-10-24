@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from difflib import SequenceMatcher
 
 try:  # rapidfuzz is optional; difflib fallback keeps tests dependency-light.
@@ -49,7 +50,11 @@ ALIASES: dict[str, str] = {
     "tl": "Team Liquid", "liquid": "Team Liquid", "c9": "Cloud9", "cloud9": "Cloud9",
     "fly": "FlyQuest", "flyquest": "FlyQuest", "100": "100 Thieves", "100t": "100 Thieves",
     "dig": "Dignitas", "sr": "Shopify Rebellion", "imt": "Immortals", "nrg": "NRG",
-    "lyon": "LYON", "dsg": "Disguised", "sen": "Sentinels", "sentinels": "Sentinels",
+    "lyon": "LYON", "lyongaming": "LYON", "dsg": "Disguised",
+    # 2026 sponsor names on DFS boards / books (Worlds 2026)
+    "teamliquidalienware": "Team Liquid", "tlalienware": "Team Liquid",
+    "liquidalienware": "Team Liquid", "tla": "Team Liquid",
+    "cloud9kia": "Cloud9", "c9kia": "Cloud9", "sen": "Sentinels", "sentinels": "Sentinels",
     # LCP (Pacific). Only applied when the target name exists in the data; otherwise the
     # fuzzy matcher handles it.
     "mvk": "MVK Esports", "mvke": "MVK Esports", "gam": "GAM Esports",
@@ -60,12 +65,19 @@ ALIASES: dict[str, str] = {
     # CBLOL / LTA South
     "loud": "LOUD", "fur": "FURIA", "furia": "FURIA", "vks": "Vivo Keyd Stars",
     "keyd": "Vivo Keyd Stars", "pain": "paiN Gaming", "png": "paiN Gaming",
+    "los": "LØS", "losesports": "LØS", "lsesports": "LØS",
     "red": "RED Kalunga", "fx": "Fluxo W7M", "fluxo": "Fluxo W7M",
 }
 
 
+# Letters NFKD does not decompose (OE spells the CBLOL team "LØS": "LOS" must hit it).
+_TRANSLIT = str.maketrans({"ø": "o", "æ": "ae", "œ": "oe", "ß": "ss", "đ": "d", "ł": "l",
+                           "þ": "th", "ð": "d"})
+
+
 def normalize(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+    s = unicodedata.normalize("NFKD", name.lower().translate(_TRANSLIT))
+    return re.sub(r"[^a-z0-9]", "", s.encode("ascii", "ignore").decode())
 
 
 def _score(a: str, b: str) -> float:

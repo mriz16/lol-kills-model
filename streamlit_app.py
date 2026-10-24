@@ -20,6 +20,8 @@ sys.path.insert(0, str(ROOT))
 
 from src import config as C  # noqa: E402
 from src.app import grading, picklog, slatelog  # noqa: E402
+from src.data import databranch  # noqa: E402
+from src.data.upload import UploadError, process_upload  # noqa: E402
 from src.app.names import search_teams  # noqa: E402
 from src.app.ocr import ocr_image, parse_board_text, props_to_lines  # noqa: E402
 from src.app.slate import (MARKET_BY_FORMAT, MIN_EDGE, PLATFORMS, THIN_EDGE,  # noqa: E402
@@ -38,16 +40,80 @@ LEAGUE_AUTO = "auto"
 
 
 # ============================================================== data (cached) ====
-def data_version() -> str:
-    files = [C.DATA_DIR / "players.parquet", C.DATA_DIR / "teams.parquet",
-             C.DATA_DIR / "calib_pairs.parquet", C.DATA_DIR / "spread_rows.parquet",
+# Match data: the latest commit of the `data` branch (uploads from this app, via the
+# GitHub API), else an upload kept on this container's disk, else the parquet bundled in
+# main. VERSION = data key + calibration files, the cache key of the store and the sims.
+LOCAL_DATA = ROOT / ".data_cache"
+
+
+def _secret(section: str, key: str, default=None):
+    try:
+        return st.secrets[section][key]
+    except Exception:
+        return default
+
+
+@st.cache_resource
+def get_data_branch():
+    """(GitHubDataBranch, True) with the [github] secrets, else (LocalDataBranch, False)."""
+    token, repo = _secret("github", "token"), _secret("github", "repo")
+    if token and repo:
+        return databranch.GitHubDataBranch(
+            token, repo, _secret("github", "data_branch", databranch.DATA_BRANCH)), True
+    return databranch.LocalDataBranch(LOCAL_DATA), False
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def data_head(nonce: int) -> tuple[str | None, str | None]:
+    """(commit sha of the data branch, error). Re-checked every 5 min so an upload from
+    another device shows up without a restart."""
+    branch, remote = get_data_branch()
+    if not remote:
+        return None, None
+    try:
+        return branch.head(), None
+    except Exception as exc:
+        return None, f"Could not reach the data branch: {exc}"
+
+
+def calib_version() -> str:
+    files = [C.DATA_DIR / "calib_pairs.parquet", C.DATA_DIR / "spread_rows.parquet",
              C.DATA_DIR / "w_rows.parquet", C.DATA_DIR / "w_lambda_real.json"]
     return "-".join(str(int(f.stat().st_mtime)) + str(f.stat().st_size) for f in files
                     if f.exists())
 
 
-@st.cache_data(show_spinner="Loading match data...")
+def data_key() -> str:
+    """branch:<sha> | local:<hash> | bundled:<mtime>."""
+    local = databranch.LocalDataBranch(LOCAL_DATA)
+    if ss().get("data_override") == "local" and local.head():
+        return f"local:{local.head()}"
+    sha, err = data_head(ss()["data_nonce"])
+    if err:
+        ss()["data_error"] = err
+    if sha:
+        return f"branch:{sha}"
+    if local.head():
+        return f"local:{local.head()}"
+    f = C.DATA_DIR / "teams.parquet"
+    return f"bundled:{int(f.stat().st_mtime)}{f.stat().st_size}"
+
+
+def data_version() -> str:
+    return data_key() + "|" + calib_version()
+
+
+@st.cache_data(show_spinner="Loading match data...", max_entries=2)
 def load_frames(version: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    kind, _, ref = version.split("|")[0].partition(":")
+    if kind == "branch":
+        frames = databranch.load_frames(get_data_branch()[0], ref)
+        if frames is not None:
+            return frames
+    if kind == "local":
+        frames = databranch.load_frames(databranch.LocalDataBranch(LOCAL_DATA))
+        if frames is not None:
+            return frames
     return (pd.read_parquet(C.DATA_DIR / "players.parquet"),
             pd.read_parquet(C.DATA_DIR / "teams.parquet"))
 
@@ -81,13 +147,6 @@ def app_sim_fn(store, m, lines, odds, league, n_sims, seed):
 
 
 # ============================================================== pick log store ====
-def _secret(section: str, key: str, default=None):
-    try:
-        return st.secrets[section][key]
-    except Exception:
-        return default
-
-
 @st.cache_resource
 def get_log_store():
     token = _secret("github", "token")
@@ -158,6 +217,8 @@ def init_state():
     ss().setdefault("sims", {})
     ss().setdefault("log_nonce", 0)
     ss().setdefault("slate_meta", None)
+    ss().setdefault("data_nonce", 0)
+    ss().setdefault("upload_summary", None)
 
 
 def block_values(bid: int) -> dict:
@@ -637,10 +698,115 @@ def slate_log_section(store: DataStore):
                 + (" (ready: run scripts/refit_w_real.py)" if n_real >= need else ""))
 
 
+# ============================================================== data upload ====
+def league_banner(teams: pd.DataFrame) -> str:
+    """'Data through' per in-scope league, most recent first; leagues with no games last."""
+    last = teams.astype({"league": str}).groupby("league")["date"].max()
+    last = last[last.index.isin(C.LEAGUES)].sort_values(ascending=False)
+    parts = [f"**{lg}** {d:%Y-%m-%d}" for lg, d in last.items()]
+    none = [lg for lg in C.LEAGUES if lg not in last.index and lg != "Worlds"]
+    return " · ".join(parts) + (f" · no games: {', '.join(none)}" if none else "")
+
+
+def data_section(players: pd.DataFrame, teams: pd.DataFrame):
+    """Top of the page: data freshness per league, and the OE file uploader."""
+    last = pd.Timestamp(teams["date"].max())
+    age = (pd.Timestamp.now(tz="UTC").tz_localize(None) - last).days
+    src = VERSION.split("|")[0].split(":")[0]
+    where = {"branch": "data branch", "local": "this server's disk only (not saved to "
+             "GitHub)", "bundled": "bundled with the app (no upload yet)"}[src]
+    box = st.warning if age >= 2 else st.info
+    box(f"Data through {last:%Y-%m-%d} ({age} day{'s' if age != 1 else ''} ago) · "
+        f"source: {where}\n\n{league_banner(teams)}")
+    if ss().get("data_error"):
+        st.error(ss().pop("data_error") + " Using the last data this server loaded.")
+    up = st.file_uploader("Upload Oracle's Elixir match data (.csv or .zip)",
+                          type=["csv", "zip"], key="oe_upload",
+                          help="The yearly OE file. New games are added and games already "
+                               "stored are replaced (by gameid); nothing older is dropped.")
+    if up is not None and st.button("Merge into data", type="primary", key="oe_merge"):
+        merge_upload(up, players, teams)
+    summary = ss().get("upload_summary")
+    if summary:
+        show_upload_summary(summary)
+
+
+def merge_upload(up, players: pd.DataFrame, teams: pd.DataFrame):
+    branch, remote = get_data_branch()
+    # the branch commit these frames came from: a newer one (another upload) is a conflict.
+    # Frames from an unsaved local merge already contain the branch data they were merged
+    # on, so they are written on top of whatever the branch holds now.
+    kind, _, ref = VERSION.split("|")[0].partition(":")
+    expected = ref if kind == "branch" else ("unchecked" if kind == "local" else None)
+    try:
+        with st.spinner(f"Parsing {up.name}..."):
+            res = process_upload(up, up.name, players, teams)
+    except UploadError as exc:
+        st.error(str(exc))
+        return
+    except Exception as exc:
+        st.error(f"Could not process {up.name}: {exc}")
+        return
+    summary = {"source": res.source, "added": res.games_added,
+               "updated": res.games_updated, "player_rows": res.player_rows_added,
+               "ranges": res.ranges, "warnings": list(res.warnings), "audit": res.audit_md,
+               "saved": None}
+    try:
+        with st.spinner("Saving to the data branch..." if remote else "Saving..."):
+            if remote:
+                databranch.save_frames(branch, res.players, res.teams, res.audit_md,
+                                       res.source, expected_head=expected)
+                ss().pop("data_override", None)
+                summary["saved"] = "Saved to the `data` branch on GitHub."
+            else:
+                databranch.save_frames(branch, res.players, res.teams, res.audit_md,
+                                       res.source)
+                ss()["data_override"] = "local"
+                summary["warnings"].insert(0, "No GitHub secrets: the merged data is on "
+                                              "this server's disk only and is lost on "
+                                              "restart.")
+    except databranch.ConflictError:
+        st.error("The data branch changed while this file was processed (another upload?). "
+                 "Nothing was saved: press Merge again to merge on top of it.")
+        data_head.clear()
+        return
+    except Exception as exc:
+        databranch.save_frames(databranch.LocalDataBranch(LOCAL_DATA), res.players,
+                               res.teams, res.audit_md, res.source)
+        ss()["data_override"] = "local"
+        summary["warnings"].insert(0, f"NOT saved to GitHub ({exc}). This server uses the "
+                                      "merged data until it restarts; upload again later.")
+    ss()["upload_summary"] = summary
+    # new data: drop every cached frame / pool / sim and rebuild from the new version
+    ss()["data_nonce"] += 1
+    for fn in (data_head, load_frames, get_store, cached_sim):
+        fn.clear()
+    ss()["results"], ss()["sims"] = None, {}
+    st.rerun()
+
+
+def show_upload_summary(s: dict):
+    msg = (f"{s['source']}: {s['added']} new game(s), {s['updated']} already stored "
+           f"(replaced), {s['player_rows']} player rows added.")
+    (st.success if s["saved"] else st.warning)(msg + (f" {s['saved']}" if s["saved"] else ""))
+    for w in s["warnings"]:
+        st.warning(w)
+    with st.expander("Upload audit"):
+        r = s["ranges"].copy()
+        for c in ("before_last", "first", "last"):
+            r[c] = pd.to_datetime(r[c]).dt.strftime("%Y-%m-%d")
+        st.dataframe(r.rename(columns={"before_last": "last before", "in_upload": "in file"}),
+                     hide_index=True, width="stretch")
+        st.markdown(s["audit"])
+    st.button("Dismiss", key="dismiss_upload",
+              on_click=lambda: ss().update(upload_summary=None))
+
+
 # ============================================================== main ====
 init_state()
 VERSION = data_version()
 st.title("🎯 LoL Kills Props")
+data_section(*load_frames(VERSION))
 with st.expander("Mode: live or backfill", expanded=False):
     backfill = st.toggle("Backfill a past slate", key="backfill",
                          help="Project a past slate from data before its date only.")
@@ -663,8 +829,8 @@ if store.backfill:
 age = (pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timestamp(store.last_date)).days
 if not store.backfill and age >= 2:
     st.warning(f"Match data ends {store.last_date:%Y-%m-%d} ({age} days ago). If games were "
-               "played since, the daily refresh failed (GitHub → Actions → refresh-data); "
-               "recent form and rosters are missing from these projections.")
+               "played since, upload the latest Oracle's Elixir file above: recent form "
+               "and rosters are missing from these projections.")
 st.caption(f"OE data through {store.last_date:%Y-%m-%d} · patch {store.patch_name} · "
            f"locked model (shrink30 + A + B50 + O + S), 20,000 sims · {cal_note}")
 tabs = st.tabs(["Slate", "Screenshot (beta)", "Results", "Slip", "Record"])

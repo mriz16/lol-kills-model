@@ -1,0 +1,63 @@
+name: grade-picks
+
+# Grades the pick log and the slate log (picks-log branch) against the match data on the
+# `data` branch. Match data is no longer downloaded: the user uploads the Oracle's Elixir
+# file in the app, which commits the processed parquet to the `data` branch through the
+# GitHub API (never to main, which would redeploy the app). Runs three times a day so new
+# uploads are graded and pending picks past the 7-day window are voided.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+    - cron: "17 11 * * *"
+    - cron: "17 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data       # same group as calibrate.yml
+  cancel-in-progress: false
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Match data from the data branch
+        run: scripts/fetch_data_branch.sh "$RUNNER_TEMP/oe"
+      - name: Publish the data audit to the job summary
+        run: |
+          if git show FETCH_HEAD:reports/data_audit.md >/dev/null 2>&1; then
+            git show FETCH_HEAD:reports/data_audit.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Grade logged picks and the slate log (picks-log branch)
+        # The app logs played picks to logs/picks.csv and every entered line to
+        # logs/slates.csv on the picks-log branch (GitHub API). Grade both against the
+        # data branch parquet and commit logs/graded.csv + logs/slates_graded.csv there.
+        run: |
+          if ! git ls-remote --exit-code --heads origin picks-log >/dev/null; then
+            echo "no picks-log branch yet (nothing logged)"; exit 0
+          fi
+          git fetch origin picks-log
+          git worktree add --detach "$RUNNER_TEMP/picks-log" origin/picks-log
+          python scripts/grade_picks.py --data "$RUNNER_TEMP/oe" \
+            --log-root "$RUNNER_TEMP/picks-log"
+          cd "$RUNNER_TEMP/picks-log"
+          git add -f logs/graded.csv 2>/dev/null || true
+          git add -f logs/slates_graded.csv 2>/dev/null || true
+          if git diff --cached --quiet; then echo "no grading changes"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "log: grade picks ($(date -u +%F))"
+          for i in 1 2 3; do
+            git push origin HEAD:picks-log && exit 0
+            git fetch origin picks-log && git rebase origin/picks-log
+          done
+          exit 1

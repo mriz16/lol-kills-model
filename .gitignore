@@ -9,4 +9,4 @@ data/synthetic/
 reports/backtest_rows*.parquet
 .streamlit/secrets.toml
 logs/
-.oe_cache/
+.data_cache/

@@ -1,126 +1,29 @@
-"""Download Oracle's Elixir yearly match CSV(s) and write compact parquet to data/.
+"""Process a local Oracle's Elixir CSV (or .zip) into data/*.parquet: the same pipeline
+the app's uploader runs (src.data.upload), for dev and one-off rebuilds.
 
 Usage:
-    python scripts/refresh_data.py                 # current + previous year from Drive
-    python scripts/refresh_data.py --years 2025 2026
-    python scripts/refresh_data.py --csv path/to/2026_LoL_esports_match_data_from_OraclesElixir.csv
+    python scripts/refresh_data.py --csv 2026_LoL_esports_match_data_from_OraclesElixir.csv
+    python scripts/refresh_data.py --csv 2026.zip --out data/      # merge into data/
+    python scripts/refresh_data.py --csv 2025.csv 2026.csv --replace
 
-OE publishes one CSV per year in a public Google Drive folder. The folder id can be
-overridden with OE_DRIVE_FOLDER_ID; individual file ids with OE_FILE_ID_<YEAR>.
-
-Drive throttles popular files ("Too many users have viewed or downloaded this file
-recently"), so each download is retried with backoff, and `--cache-dir` keeps finished
-years' CSVs (any year before the current one) so a run only hits Drive for this year.
+By default each file is merged into the parquet already in --out by gameid (uploaded games
+replace stored ones, nothing else is dropped); --replace starts from empty. Data is no
+longer downloaded from Google Drive: the user uploads the OE file in the app, which saves
+the parquet to the `data` branch (src.data.databranch).
 """
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import os
-import shutil
 import sys
-import tempfile
-import time
 from pathlib import Path
 
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.config import DATA_DIR, LEAGUES, REPORTS_DIR  # noqa: E402
-from src.data.audit import audit  # noqa: E402
-from src.data.oe import REQUIRED_COLUMNS, process  # noqa: E402
+from src.config import DATA_DIR, REPORTS_DIR  # noqa: E402
+from src.data.upload import UploadError, process_upload  # noqa: E402
 
 MAX_PARQUET_MB = 50
-
-
-class DataError(RuntimeError):
-    """Download/parse produced unusable data: fail the job loudly."""
-
-
-DEFAULT_FOLDER_ID = "1gLSw0RLjBbtaNy0dgnGQDAZOHIgCe-HH"
-FILE_TEMPLATE = "{year}_LoL_esports_match_data_from_OraclesElixir.csv"
-RETRY_WAITS = (60, 180, 420)  # seconds between download attempts (Drive quota errors)
-
-
-def _retry(fn, what: str, waits=RETRY_WAITS):
-    """Call fn(); on a Drive error wait and try again. FileNotFoundError is not retried."""
-    for attempt in range(len(waits) + 1):
-        try:
-            return fn()
-        except FileNotFoundError:
-            raise
-        except Exception as exc:  # gdown.FileURLRetrievalError, HTTP errors, ...
-            msg = str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc)
-            if attempt == len(waits):
-                raise DataError(f"{what}: Google Drive refused the download after "
-                                f"{attempt + 1} tries ({msg})") from exc
-            print(f"::warning::{what}: attempt {attempt + 1} failed ({msg}); "
-                  f"retrying in {waits[attempt]} s")
-            time.sleep(waits[attempt])
-
-
-def download_year(year: int, out_dir: Path, waits=RETRY_WAITS) -> Path:
-    import gdown
-
-    target = out_dir / FILE_TEMPLATE.format(year=year)
-
-    def get(file_id):
-        target.unlink(missing_ok=True)
-        if not gdown.download(id=file_id, output=str(target), quiet=False):
-            raise RuntimeError("gdown returned no file")
-        check_not_html(target)  # a quota page saved as the CSV is retried too
-
-    file_id = os.environ.get(f"OE_FILE_ID_{year}")
-    if not file_id:
-        folder = os.environ.get("OE_DRIVE_FOLDER_ID") or DEFAULT_FOLDER_ID
-        files = _retry(lambda: gdown.download_folder(id=folder, skip_download=True,
-                                                     quiet=True) or [],
-                       f"listing Drive folder {folder}", waits)
-        match = [f for f in files if Path(f.path).name == target.name]
-        if not match:
-            raise FileNotFoundError(f"{target.name} not found in Drive folder {folder}")
-        file_id = match[0].id
-    _retry(lambda: get(file_id), target.name, waits)
-    return target
-
-
-def fetch_year(year: int, tmp: Path, cache_dir: Path | None, this_year: int) -> Path:
-    """A finished year (before this_year) comes from cache_dir when present."""
-    name = FILE_TEMPLATE.format(year=year)
-    cached = cache_dir / name if cache_dir else None
-    if cached is not None and year < this_year and cached.exists():
-        try:
-            check_not_html(cached)
-            print(f"{name}: using cached copy")
-            return cached
-        except DataError:
-            cached.unlink()
-    path = download_year(year, tmp)
-    if cached is not None and year < this_year:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, cached)
-    return path
-
-
-def check_not_html(path: Path) -> None:
-    """Drive quota/permission errors come back as an HTML page saved under the CSV name."""
-    if not path.exists() or path.stat().st_size == 0:
-        raise DataError(f"{path.name}: download is missing or empty")
-    head = path.read_bytes()[:2048].lstrip().lower()
-    if head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<html" in head:
-        raise DataError(f"{path.name}: download returned HTML, not CSV "
-                        f"(Drive quota / permissions / wrong file id?)")
-
-
-def read_csv(path: Path) -> pd.DataFrame:
-    check_not_html(path)
-    df = pd.read_csv(path, low_memory=False)
-    if len(df) == 0:
-        raise DataError(f"{path.name}: 0 rows")
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise DataError(f"{path.name}: not an OE match file, missing columns {missing}")
-    return df
 
 
 def write(players: pd.DataFrame, teams: pd.DataFrame, out_dir: Path) -> float:
@@ -129,54 +32,42 @@ def write(players: pd.DataFrame, teams: pd.DataFrame, out_dir: Path) -> float:
     teams.to_parquet(out_dir / "teams.parquet", index=False, compression="zstd")
     mb = sum((out_dir / f).stat().st_size for f in ("players.parquet", "teams.parquet")) / 2**20
     if mb > MAX_PARQUET_MB:
-        raise DataError(f"parquet is {mb:.1f} MB (> {MAX_PARQUET_MB} MB limit)")
+        raise UploadError(f"parquet is {mb:.1f} MB (> {MAX_PARQUET_MB} MB limit)")
     return mb
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--years", type=int, nargs="*")
-    ap.add_argument("--csv", type=Path, nargs="*", help="use local CSV(s) instead of Drive")
+    ap.add_argument("--csv", type=Path, nargs="+", required=True,
+                    help="OE match CSV(s) or .zip(s)")
     ap.add_argument("--out", type=Path, default=DATA_DIR)
     ap.add_argument("--audit", type=Path, default=REPORTS_DIR / "data_audit.md")
-    ap.add_argument("--cache-dir", type=Path,
-                    help="keep / reuse CSVs of finished years (before the current one)")
+    ap.add_argument("--replace", action="store_true",
+                    help="ignore the parquet already in --out")
     args = ap.parse_args(argv)
+    players = teams = None
+    if not args.replace and (args.out / "teams.parquet").exists():
+        players = pd.read_parquet(args.out / "players.parquet")
+        teams = pd.read_parquet(args.out / "teams.parquet")
+    audits = []
     try:
-        return run(args)
-    except DataError as exc:
+        for path in args.csv:
+            with open(path, "rb") as f:
+                res = process_upload(f, path.name, players, teams)
+            players, teams = res.players, res.teams
+            audits.append(res.audit_md)
+            print(f"{path.name}: {res.games_added} games added, {res.games_updated} replaced")
+            for w in res.warnings:
+                print(f"::warning::{w}")
+        mb = write(players, teams, args.out)
+    except (UploadError, OSError) as exc:
         print(f"::error::{exc}")
         print(f"error: {exc}", file=sys.stderr)
         return 1
-
-
-def run(args) -> int:
-    if args.csv:
-        paths = list(args.csv)
-    else:
-        this_year = dt.date.today().year
-        years = args.years or [this_year - 1, this_year]
-        tmp = Path(tempfile.mkdtemp(prefix="oe_"))
-        paths = []
-        for y in years:
-            try:
-                paths.append(fetch_year(y, tmp, args.cache_dir, this_year))
-            except FileNotFoundError as exc:  # e.g. next year's file not published yet
-                print(f"::warning::{exc}")
-        if not paths:
-            raise DataError("nothing downloaded")
-
-    raw = pd.concat([read_csv(p) for p in paths], ignore_index=True)
-    players, teams = process(raw, LEAGUES)
-    if len(teams) == 0:
-        raise DataError("0 complete in-scope games after filtering (league codes changed?)")
-    text, missing = audit(raw, players, teams, [p.name for p in paths])
+    text = "\n\n".join(audits)
     print(text)
     args.audit.parent.mkdir(parents=True, exist_ok=True)
     args.audit.write_text(text)
-    for lg in missing:
-        print(f"::warning::expected league code {lg} not found in OE data")
-    mb = write(players, teams, args.out)
     print(f"wrote {len(players)} player rows, {len(teams)} team rows ({mb:.2f} MB) -> {args.out}")
     return 0
 
