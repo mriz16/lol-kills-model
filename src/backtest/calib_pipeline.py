@@ -14,8 +14,8 @@ import numpy as np
 import pandas as pd
 
 from src.config import PRIZEPICKS_POWER
-from src.engine.calibration import (Calibrator, calibrate_pmf, fit_spread, fit_w,
-                                    inflate_pmf, pairs_from_rows, select_top)
+from src.engine.calibration import (Calibrator, GoblinCal, calibrate_pmf, fit_spread, fit_w,
+                                    goblin_pairs, inflate_pmf, pairs_from_rows, select_top)
 
 BE_2L = (1 / PRIZEPICKS_POWER[2]) ** 0.5
 N_MAPS = {"Map 1": 1, "Maps 1-2": 2, "Maps 1-3": 3}
@@ -98,7 +98,9 @@ def apply_calibration(base: pd.DataFrame, P: np.ndarray, method: str) -> np.ndar
 def proxy_lines(players: pd.DataFrame) -> pd.DataFrame:
     """Per (series_id, player, market): floor(rolling median of the player's prior market
     totals) + 0.5. Prior = series that started strictly earlier; last PROXY_WINDOW
-    qualifying series, at least PROXY_MIN; else n_maps x median of the last 20 maps."""
+    qualifying series, at least PROXY_MIN; else n_maps x median of the last 20 maps.
+    proxy_mean = the same window's mean to the nearest half point (x.5), the PP-like line
+    the goblin map is fitted below (reports/goblin_fit.md)."""
     p = players[["series_id", "playername", "map_no", "kills", "date"]].copy()
     p["series_id"] = p["series_id"].astype(str)
     p["playername"] = p["playername"].astype(str)
@@ -122,18 +124,22 @@ def proxy_lines(players: pd.DataFrame) -> pd.DataFrame:
             for mkt, n in N_MAPS.items():
                 h = hist[n][-PROXY_WINDOW:]
                 if len(h) >= PROXY_MIN:
-                    med = float(np.median(h))
+                    med, avg = float(np.median(h)), float(np.mean(h))
                 elif len(maps_hist) >= PROXY_MIN:
                     med = n * float(np.median(maps_hist[-20:]))
+                    avg = n * float(np.mean(maps_hist[-20:]))
                 else:
-                    med = np.nan
-                out.append((sid, pl, mkt, np.floor(med) + 0.5 if np.isfinite(med) else np.nan))
+                    med = avg = np.nan
+                ok = np.isfinite(med)
+                out.append((sid, pl, mkt, np.floor(med) + 0.5 if ok else np.nan,
+                            np.round(avg - 0.5) + 0.5 if ok else np.nan))
             by_map = dict(zip(r["mapno"], r["maps"]))
             totals = {n: sum(by_map[m] for m in range(1, n + 1)) for n in (1, 2, 3)
                       if all(m in by_map for m in range(1, n + 1))}
             pending.append((totals, [by_map[m] for m in sorted(by_map)]))
             prev_start = r["start"]
-    return pd.DataFrame(out, columns=["series_id", "player", "market", "proxy_line"])
+    return pd.DataFrame(out, columns=["series_id", "player", "market", "proxy_line",
+                                      "proxy_mean"])
 
 
 def line_rows(base: pd.DataFrame, P: np.ndarray, line_col: str = "proxy_line") -> pd.DataFrame:
@@ -218,7 +224,7 @@ def build(base: pd.DataFrame, players: pd.DataFrame) -> dict:
     PS, ks = apply_spread(base, P0)
     PSI = apply_calibration(base, PS, CAL_METHOD)
     prox = proxy_lines(players)
-    b = base.drop(columns=[c for c in ("proxy_line",) if c in base]).merge(
+    b = base.drop(columns=[c for c in ("proxy_line", "proxy_mean") if c in base]).merge(
         prox, on=["series_id", "player", "market"], how="left")
     wrows, fits = apply_w(line_rows(b, PSI))
     pairs = pd.concat([pairs_from_rows(base.assign(pmf=list(P))).assign(model=m)
@@ -226,8 +232,11 @@ def build(base: pd.DataFrame, players: pd.DataFrame) -> dict:
     pairs["p"] = pairs["p"].astype("float32")
     pairs["offset"] = pairs["offset"].astype("float32")
     pairs["y"] = pairs["y"].astype("int8")
+    # G: goblin lines under the mean-based PP-like line, on the S pmfs (what the app's
+    # goblin column reads); rows are aligned with b (same order as base)
+    gob = goblin_pairs(b, PS, "proxy_mean")
     return dict(P0=P0, PS=PS, PSI=PSI, ks=ks, base=b, wrows=wrows, w_fits=fits,
-                pairs=pairs, spread_rows=base[SPREAD_COLS].copy())
+                pairs=pairs, spread_rows=base[SPREAD_COLS].copy(), goblin_pairs=gob)
 
 
 def params_summary(art: dict, cutoff=None) -> dict:
@@ -254,6 +263,10 @@ def params_summary(art: dict, cutoff=None) -> dict:
         "calib_grid": grid,
         "w_lambda": {k: (int(v) if k == "_n" else round(float(v), 4)) for k, v in lam.items()},
         "min_edge_suggested": derive_min_edge(w)[0],
+        "goblin_maps": {pos: [round(float(x), 4) for x in m(np.array(grid))]
+                        for pos, m in GoblinCal.fit(
+                            gp[pd.to_datetime(gp["date"]) <= lim]).maps.items()}
+        if (gp := art.get("goblin_pairs")) is not None else {},
     }
 
 
@@ -283,14 +296,18 @@ def compare_params(old: dict | None, new: dict) -> list[str]:
 
 def write_artifacts(art: dict, data_dir: Path, params: dict) -> list[Path]:
     """data/calib_pairs.parquet (I), data/spread_rows.parquet (S), data/w_rows.parquet
-    (W, calibrated P at proxy lines) and data/calib_params.json (fitted summary)."""
+    (W, calibrated P at proxy lines), data/goblin_pairs.parquet (G) and
+    data/calib_params.json (fitted summary)."""
     data_dir.mkdir(parents=True, exist_ok=True)
     out = []
     w = art["wrows"][W_COLS].copy()
     for c in ("p_more", "p_less", "p_push"):
         w[c] = w[c].astype("float32")
     for name, df in (("calib_pairs.parquet", art["pairs"]),
-                     ("spread_rows.parquet", art["spread_rows"]), ("w_rows.parquet", w)):
+                     ("spread_rows.parquet", art["spread_rows"]), ("w_rows.parquet", w),
+                     ("goblin_pairs.parquet", art.get("goblin_pairs"))):
+        if df is None:
+            continue
         df.to_parquet(data_dir / name, index=False)
         out.append(data_dir / name)
     (data_dir / "calib_params.json").write_text(json.dumps(params, indent=1) + "\n")

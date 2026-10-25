@@ -346,3 +346,67 @@ def fit_w_asof(rows: pd.DataFrame, cutoff, breakeven: float,
                lag: pd.Timedelta = pd.Timedelta(days=1)) -> dict:
     d = pd.to_datetime(rows["date"])
     return fit_w(rows[d <= pd.Timestamp(cutoff) - lag], breakeven)
+
+
+# ------------------------------------------------------------------ G: goblin lines ----
+# P(more) at lines 1-4 kills under a PP-like line (reports/goblin_fit.md). Walk-forward
+# since 2025-06, the S pmf is already sharp there for top / jng / mid / bot: picks at the
+# highest goblin line with P >= 73.3% predicted 79.1% and hit 80.0% (n=16,032). Supports
+# run hot (81.1% predicted, 79.2% hit; 92% -> 84%), so supports get their own beta map.
+GOBLIN_DEPTHS = (1, 2, 3, 4)
+GOBLIN_MAP_POSITIONS = ("sup",)
+GOBLIN_MIN_PAIRS = 2000
+
+
+def goblin_depth(std_line: float, line: float) -> int:
+    """Whole kills a goblin line sits under the standard line (4.0 -> 3.5 is depth 1)."""
+    return int(min(max(np.ceil(float(std_line) - float(line) - 1e-9), 1), GOBLIN_DEPTHS[-1]))
+
+
+def goblin_pairs(base: pd.DataFrame, P: np.ndarray, line_col: str = "proxy_mean",
+                 extra: tuple = ()) -> pd.DataFrame:
+    """(date, position, market, depth, p, y): P(X > line - d) of the pmfs and the outcome,
+    d = 1..4 under each row's PP-like line (rows without one, or lines <= 0, dropped).
+    `extra`: more columns of base to carry (reports)."""
+    surv = 1.0 - np.cumsum(P, axis=1)
+    std = base[line_col].to_numpy(float)
+    y = base["y"].to_numpy(float)
+    parts = []
+    for d in GOBLIN_DEPTHS:
+        line = std - d
+        ok = np.isfinite(line) & (line > 0)
+        j = np.clip(np.floor(np.nan_to_num(line)).astype(int), 0, P.shape[1] - 1)
+        parts.append(pd.DataFrame({
+            "date": base["date"].to_numpy()[ok], "position": base["position"].to_numpy()[ok],
+            "market": base["market"].to_numpy()[ok], "depth": np.int8(d),
+            "p": surv[np.arange(len(P)), j][ok].astype("float32"),
+            "y": (y > line)[ok].astype("int8"),
+            **{c: base[c].to_numpy()[ok] for c in extra}}))
+    return pd.concat(parts, ignore_index=True)
+
+
+@dataclass
+class GoblinCal:
+    """position -> BetaMap for the positions whose goblin P(more) is miscalibrated; every
+    other position keeps the model's P."""
+    maps: dict = field(default_factory=dict)
+
+    @classmethod
+    def fit(cls, pairs: pd.DataFrame) -> "GoblinCal":
+        out = cls()
+        for pos in GOBLIN_MAP_POSITIONS:
+            g = pairs[pairs["position"] == pos]
+            if len(g) >= GOBLIN_MIN_PAIRS:
+                out.maps[pos] = BetaMap.fit(g["p"].to_numpy(float), g["y"].to_numpy(float))
+        return out
+
+    def __call__(self, p, position: str):
+        p = np.asarray(p, dtype=float)
+        m = self.maps.get(position)
+        return np.clip(m(p), 0.0, 1.0) if m is not None else p
+
+
+def fit_goblin_asof(pairs: pd.DataFrame, cutoff,
+                    lag: pd.Timedelta = pd.Timedelta(days=1)) -> GoblinCal:
+    d = pd.to_datetime(pairs["date"])
+    return GoblinCal.fit(pairs[d <= pd.Timestamp(cutoff) - lag])

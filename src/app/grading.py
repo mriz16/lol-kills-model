@@ -13,6 +13,7 @@ import pandas as pd
 
 from src.app.picklog import GRADED_COLUMNS
 from src.app.slate import PLATFORMS
+from src.config import PRIZEPICKS_FLEX
 from src.backtest.metrics import calibration_table
 from src.engine.sim import parse_market
 
@@ -110,32 +111,45 @@ def merge_graded(old: pd.DataFrame, new: pd.DataFrame, id_col: str = "pick_id") 
 
 
 def settle_slips(picks: pd.DataFrame, graded: pd.DataFrame) -> pd.DataFrame:
-    """Per slip: status and profit. Pushed / void legs drop out and the slip pays the
-    table multiplier for the remaining legs; fewer than 2 left -> refund. Any lost leg
-    loses the slip. (Platform rules for reduced slips vary; this is the approximation.)"""
+    """Per slip: status and profit. Pushed / void legs drop out; fewer than 2 left ->
+    refund. Power: any lost leg loses the slip; a full slip with a goblin / demon leg pays
+    its logged payout (what PrizePicks showed), otherwise the table multiplier for the
+    remaining legs. Flex (mode "flex"): pays the PrizePicks Flex table for the hits
+    among the remaining legs ("partial" when that returns less than the stake).
+    (Platform rules for reduced slips vary; this is the approximation.)"""
     if picks.empty:
-        return pd.DataFrame(columns=["slip_id", "platform", "n_legs", "stake", "status",
-                                     "profit", "p_joint", "logged_at"])
+        return pd.DataFrame(columns=["slip_id", "platform", "mode", "n_legs", "stake",
+                                     "status", "profit", "p_joint", "logged_at"])
     df = picks.merge(graded[["pick_id", "status"]], on="pick_id", how="left")
     df["status"] = df["status"].fillna("pending")
     rows = []
     for sid, g in df.groupby("slip_id", sort=False):
         stake = float(g["stake"].iloc[0] or 0)
         platform = str(g["platform"].iloc[0])
+        mode = str(g["mode"].iloc[0]) if "mode" in g and pd.notna(g["mode"].iloc[0]) \
+            else "power"
         st = set(g["status"])
         live = g[g["status"].isin(["win", "loss"])]
-        if "loss" in st:
+        wins = int((live["status"] == "win").sum())
+        if mode != "flex" and "loss" in st:
             status, profit = "loss", -stake
         elif "pending" in st:
             status, profit = "pending", 0.0
         elif len(live) < 2:
             status, profit = "refund", 0.0
+        elif mode == "flex":
+            mult = PRIZEPICKS_FLEX.get(len(live), {}).get(wins, 0.0)
+            status = "win" if mult > 1 else ("partial" if mult > 0 else "loss")
+            profit = stake * (mult - 1.0)
         else:
-            mult = PLATFORMS.get(platform, {}).get(len(live))
+            pay = pd.to_numeric(g["payout"], errors="coerce").iloc[0]
+            special = "kind" in g and g["kind"].fillna("standard").ne("standard").any()
+            mult = float(pay) if special and len(live) == len(g) and np.isfinite(pay) \
+                and pay > 1 else PLATFORMS.get(platform, {}).get(len(live))
             status, profit = "win", stake * (mult - 1.0) if mult else 0.0
-        rows.append(dict(slip_id=sid, platform=platform, n_legs=len(g), stake=stake,
-                         status=status, profit=profit, p_joint=g["slip_p_joint"].iloc[0],
-                         logged_at=g["logged_at"].iloc[0]))
+        rows.append(dict(slip_id=sid, platform=platform, mode=mode, n_legs=len(g),
+                         stake=stake, status=status, profit=profit,
+                         p_joint=g["slip_p_joint"].iloc[0], logged_at=g["logged_at"].iloc[0]))
     return pd.DataFrame(rows)
 
 
@@ -145,7 +159,7 @@ def record_summary(picks: pd.DataFrame, graded: pd.DataFrame) -> dict:
     legs["status"] = legs["status"].fillna("pending")
     cnt = legs["status"].value_counts()
     slips = settle_slips(picks, graded)
-    done = slips[slips["status"].isin(["win", "loss", "refund"])]
+    done = slips[slips["status"].isin(["win", "loss", "partial", "refund"])]
     staked = float(done["stake"].sum())
     profit = float(done["profit"].sum())
     decided = legs[legs["status"].isin(["win", "loss"])]

@@ -5,7 +5,7 @@ Monte Carlo series simulator (20,000 sims per series) built on Oracle's Elixir m
 The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off. See
 `CLAUDE.md` for the full spec and `reports/` for the walk-forward backtests.
 
-- `streamlit_app.py`: the phone-first app (Slate, Screenshot, Results, Slip, Record tabs)
+- `streamlit_app.py`: the phone-first app, KILLCAST (Slate, Board, Goblins, Slip, Record, Scan tabs)
 - `src/engine/`: the simulator. `src/app/`: app logic (names, odds input, slate, OCR, pick
   log, grading).
 - Match data: you upload the Oracle's Elixir yearly CSV (or a .zip of it) at the top of
@@ -111,9 +111,11 @@ uses the workflow's own `GITHUB_TOKEN`. The Record tab also grades pending picks
 the app's data, so results show up as soon as the data has them.
 
 ### Slate log and backfill
-Every **Run slate** writes every entered line (played or not) to `logs/slates.csv` on the
+Every **Run projections** writes every entered line (played or not) to `logs/slates.csv` on the
 same branch, with all model outputs (calibrated and raw) and a `played` flag. Logging a
-slip, or "Mark lines as played" on the Results tab, sets the flag. The workflow grades
+slip, "Log lines as played" on the Board tab or "Log goblin plays" on the Goblins tab
+sets the flag (goblins get their own rows, kind goblin). Every write is read back before
+the app says it saved. The workflow grades
 every row into `logs/slates_graded.csv`; the Record tab shows the result. This is the
 real-world evaluation set.
 

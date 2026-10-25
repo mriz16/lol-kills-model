@@ -71,6 +71,13 @@ PRIOR_FULL_GAMES = 200
 # --- Payouts ------------------------------------------------------------------------
 PRIZEPICKS_POWER = {2: 3.0, 3: 5.0, 4: 10.0, 5: 20.0, 6: 40.0}
 UNDERDOG = {2: 3.0, 3: 6.0, 4: 10.0, 5: 20.0, 6: 40.0}
+# PrizePicks Flex: legs -> {hits: multiplier} (5-pick 3/5 pays 0.4x: $25 -> $10)
+PRIZEPICKS_FLEX = {3: {3: 2.25, 2: 1.25}, 4: {4: 5.0, 3: 1.5},
+                   5: {5: 10.0, 4: 2.0, 3: 0.4}, 6: {6: 25.0, 5: 2.0, 4: 0.4}}
+# Goblin breakeven default: the user's 6-pick all-goblin Power paid 8.25x
+# (2026-10-24), i.e. (1 / 8.25) ** (1 / 6) = 70.3% per leg.
+GOBLIN_DEFAULT_LEGS = 6
+GOBLIN_DEFAULT_PAYOUT = 8.25
 
 # --- Elo (backtest p_map) ------------------------------------------------------------
 ELO_K = 24.0

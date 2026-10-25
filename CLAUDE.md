@@ -137,7 +137,8 @@ src/engine/                 odds, history/features, sim, props/slips
 src/backtest/               elo, metrics, walk-forward runner
 src/engine/calibration.py   post-sim S (spread inflation), I (P(over) map), W (line shrinkage)
 src/backtest/calib_pipeline.py  walk-forward S/I/W pipeline, proxy lines, drift check
-src/app/                    app logic: names, odds_input, slate, ocr, picklog, slatelog, grading
+src/app/                    app logic: names, quick (slate box), odds_input, slate (+ goblin
+                            column, Flex), theme (look), ocr, picklog, slatelog, grading
 streamlit_app.py            Streamlit app (Phase 2)
 scripts/grade_picks.py      grade logs/picks.csv + logs/slates.csv on picks-log (grade.yml)
 scripts/spread_report.py    PIT / S / K / I / selection-bias study report
@@ -145,6 +146,7 @@ scripts/refit_calibration.py  backtest + S/I/W refit -> data/calib_pairs, spread
                             calib_params.json + reports/calibration_fit.md (calibrate.yml)
 scripts/refit_w_real.py     refit W's lambda on graded real PrizePicks lines (>= 300 rows)
 scripts/audit_unders.py     under-lean / floor / goblin audit -> reports/audit_unders_tables.md
+scripts/goblin_report.py    goblin column + side balance, walk-forward -> reports/goblin_fit.md
 packages.txt                apt packages for Streamlit Cloud (tesseract-ocr)
 tests/                      pytest (fixture in tests/fixtures/)
 ```
@@ -156,30 +158,61 @@ P off. `locked_config() == ALL_VARIANTS["L+O"]` (`LIVE_LOCKED` in walkforward.py
 uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
 
 ## Phase 2 app (`streamlit_app.py`, logic in `src/app/`)
-- Top of the page: "Data through" banner per in-scope league + the OE uploader
-  (`server.maxUploadSize = 600` MB in `.streamlit/config.toml`).
-- Tabs: Slate, Screenshot (beta), Results, Slip, Record. Mobile-first (centered layout).
-- Slate block: team search (alias table + fuzzy, `names.search_teams`), BO1/3/5,
-  platform, league (auto: shared home league, else latest international event, else WLDs),
-  series ML both teams + optional Map 1 ML (`odds_input`), lines box "player line".
-  Names are fuzzy-matched to the two teams' rosters (players seen in the team's last 60
-  days); team/role auto-filled; unmatched/ambiguous/bad lines block that matchup from
-  running. Market from format: BO1 Map 1, BO3 Maps 1-2, BO5 Maps 1-3. Lineup = latest
-  starters with matched line players swapped into their role.
-- Screenshot: pytesseract on 1 or 2 vertical strips; `ocr.parse_board_text` fills an
-  editable box; "Use these lines" copies into a chosen matchup. Never auto-runs.
-- Results: one table sorted by edge = P(model side) - (1/mult)^(1/legs) for the matchup's
-  platform; slip size for the breakeven is selectable (2-6, default 2). Probabilities and
-  edges are **shown = W(I(model with S))** by default; "Calibrated" (I only) and "Raw"
-  (sims with S) on a selector and in the tap-a-row explanation. PLAY = shown edge >=
-  `MIN_EDGE` (3 pts, `reports/calibration_fit.md`; never without calibration). All S / I /
-  W fits are as of the store's cutoff (backfill-safe). Flags: BELOW MIN (edge < 3 pts), THIN
-  EDGE (uncalibrated only, < 3 pts), LOW SAMPLE (< 20 games in window), CAUTION ("less"
-  with P(more) < 25% at a whole line). Side-balance warning when > 70% of a slate's plays
-  (>= 3) are one side.
-- Slip: joint P from shared sims within a matchup, multiplied across; shown (and
-  calibrated) joint = raw joint x each leg's shown (calibrated) / raw P, capped at the
-  weakest leg; payout and EV from the shown joint, calibrated and raw on tap.
+- Look (2026-10-25, user: "an esports AI projection machine, not a sloppy terminal"):
+  KILLCAST, dark neon theme (`src/app/theme.py`: one stylesheet + HTML card builders, data
+  escaped). Header chips: data date, patch, model, calibration, data source. Data upload,
+  "Data through" per league and backfill live in the "Data, mode and settings" expander
+  (`server.maxUploadSize = 600` MB in `.streamlit/config.toml`). The user dislikes
+  warnings: prefer chips / captions over warning boxes, no new warnings.
+- Tabs: Slate, Board, Goblins, Slip, Record, Scan. Mobile-first (centered layout).
+- Slate: ONE text box for the whole slate (`src/app/quick.py`): a header
+  `TEAM vs TEAM -150 +120` (optional `bo1/bo3/bo5`, `m1 -130 +110` Map 1 ML; "v" / "@"
+  work; or one ML after each team), then that matchup's `player line` rows. Default
+  format / platform are segmented controls. Teams resolve via `names.search_teams`
+  (alias table + fuzzy); a live preview card per matchup shows the resolved teams, per-map
+  %, matched lines and problems; matchups with problems are not run. League auto (shared
+  home league, else latest international event, else WLDs). Players fuzzy-matched to the
+  two rosters (last 60 days). Market from format: BO1 Map 1, BO3 Maps 1-2, BO5 Maps 1-3.
+  Lineup = latest starters with matched line players swapped into their role. Saved
+  slates are the text (.txt; old .json block slates load through `quick.to_text`).
+- Scan (beta): pytesseract on 1 or 2 vertical strips; `ocr.parse_board_text` fills an
+  editable box; "Use these lines" appends under a chosen matchup header. Never auto-runs.
+- Board: PLAY cards (shown edge >= `MIN_EDGE`, 3 pts) then a table of every line (tap a row
+  for its card and the explanation). Edge = P(model side) - (1/mult)^(1/legs) for the
+  matchup's platform; slip size for the breakeven (2-6, default 2) and the probability view
+  (Shown = W(I(model with S)) default, Calibrated, Raw) sit in "Model layers". All S / I /
+  W / G fits are as of the store's cutoff (backfill-safe). Flags as before (BELOW MIN,
+  THIN EDGE, LOW SAMPLE, CAUTION, GOBLIN / DEMON, SAFE FLOOR, SUP MORE) show as tags; the
+  side-balance warning box is gone.
+- Goblins (2026-10-25, user: "I enter normal lines; give me the goblin line that is a
+  play, paired with the actual breakeven"): for every standard line, `goblin_ladder` =
+  every x.5 line under it (up to 4 kills under) with goblin P(more); the goblin play =
+  the highest one with P >= goblin breakeven + `MIN_EDGE`. Goblin breakeven =
+  (1 / payout)^(1 / legs) from the tab's goblin slip legs / payout (default the user's
+  6-pick at 8.25x = 70.3%, play bar 73.3%). Goblin P = the S model (NOT W: it is sharp at
+  goblin lines), supports through G, a beta map fitted on `data/goblin_pairs.parquet`
+  (`calibration.GoblinCal`, refit weekly by calibrate.yml). Walk-forward
+  (`reports/goblin_fit.md`, `scripts/goblin_report.py`): picks at the bar predicted 79.0%,
+  hit 79.4% (n=11,660); supports raw 81.2% -> 79.1% hit, fixed by G. Every standard row
+  logs its goblin column (`gob_line`, `gob_p`, `gob_raw_p`, `gob_be`); "Log goblin plays"
+  saves chosen goblins as their own slate-log rows (kind goblin, played).
+- Slip: legs = goblin plays (G) + both sides of every line. Power: joint P from shared
+  sims within a matchup, multiplied across; shown (and calibrated) joint = raw joint x each
+  leg's shown (calibrated) / raw P, capped at the weakest leg; a slip with goblin legs
+  takes the payout PrizePicks shows (default guess: the goblin slip's per-leg multiplier).
+  Flex (PrizePicks 3-6 legs, `C.PRIZEPICKS_FLEX`, 5-pick 10x / 2x / 0.4x): P(k hits) from
+  independent shown legs (raw: shared sims), EV from the table. Logging a slip writes
+  `logs/picks.csv` (mode, kind columns) and marks its legs played (goblin legs as goblin
+  rows). Settlement: Flex by the table ("partial" when it returns < stake); a full Power
+  slip with a goblin / demon leg pays its logged payout.
+- Record: "My plays" (every slate-log line marked played, standard and goblin, with
+  hit / miss / pending), slips (W-L, ROI), model check (standard table + goblin table),
+  real-line refit progress, log connection test.
+- Logging fix (2026-10-25): the 2026-10-24 unders were saved only as `played` flags on the
+  slate log (Mark played), and the old Record tab showed only `logs/picks.csv` slips, so
+  the plays looked unsaved; no slip was ever written (no picks.csv in the branch history).
+  Every write is now read back (`slatelog.missing_rows`, `picklog.missing_picks`) before
+  the app says "saved", and Record shows every played line.
 - Slate log (`slatelog`): every Run slate logs every line (played or not) with all model
   outputs to `logs/slates.csv` on `picks-log`; `played` flag set by logging a slip or
   "Mark lines as played". Graded into `logs/slates_graded.csv` by `grade.yml`:
@@ -193,19 +226,16 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   (pools, rosters, lineups, kappas, calibrator); rows logged with `backfill = 1`; slips
   can only be marked played (no pick-log write).
 - Saves: a slate / slip that only reached local disk (no secrets) or failed shows an
-  error plus a CSV download; Record → Log connection tests the token (`picklog.check_store`,
-  creates `picks-log` if missing).
+  error plus a CSV download; Record → Test log connection checks the token
+  (`picklog.check_store`, creates `picks-log` if missing).
 - Pick log: `picklog.GitHubStore` writes `logs/picks.csv` to branch `picks-log` via the
   contents API (secrets `[github] token/repo/branch`); `LocalStore` without secrets.
   `grade.yml` grades into `logs/graded.csv` on that branch; Record tab merges those
   final grades with live grading (record, ROI, calibration of logged picks).
-- Goblins / demons (2026-10-24): a trailing `g` / `goblin` or `d` / `demon` on a line
-  (`Chovy 7.5 g`) sets `LineMatch.kind`; those rows are MORE only, never PLAY (payout is
-  not the standard multiplier), excluded from the real-line W refit; the Slip tab takes a
-  payout override when a slip has one. Every row carries `floor80` / `floor90` (most
-  kills reached in 80% / 90% of sims, with S). Flags: GOBLIN / DEMON, SAFE FLOOR (shown
-  P(more) >= 85%, not a support), SUP MORE (support overs at PP-like lines hit 55.8% at a
-  shown 67.3%). Results tab: "Safest overs & floors" (rows by shown P(more)).
+- Typed goblins / demons (2026-10-24): a trailing `g` / `goblin` or `d` / `demon` on a
+  line (`Chovy 7.5 g`) sets `LineMatch.kind`; those rows are MORE only, never PLAY,
+  excluded from the real-line W refit. Every row carries `floor80` / `floor90` (most
+  kills reached in 80% / 90% of sims, with S).
 - Caching: parquet via `st.cache_data`, `DataStore` via `st.cache_resource`, matchup
   pools + sims via `st.cache_data` keyed on the inputs. 5 matchups run in ~1 s.
 
@@ -299,5 +329,12 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   persistence have never reached GitHub (check the app's `[github]` secrets).
 - Weekly refit derives min edge 7 pts (top-1 se); app keeps the signed-off 3 pts pending
   the user.
+- 2026-10-25 (`reports/goblin_fit.md`): unders are NOT inflated. Shown PLAYs at PP-like
+  lines: LESS 68.4% -> hit 68.5% (n=8,665), MORE 67.1% -> 67.3%; since 2026-03 both
+  underclaim by ~1 pt; Map 1 LESS 67.2% -> 71.2%. Mean error since 2026-03 -0.005; by
+  position bot -0.19 (se 0.08, over-projected), top +0.10, mid +0.11 (under-projected):
+  not changed (P toggle was score-neutral; needs sign-off). User's 2026-10-24 Worlds
+  slips: unders flex 3/5 (model ~64% a leg), goblin power 5/6 (JiaQi 4.5 missed; model
+  had Supa / Ruler / JiaQi goblins at 49-58%, below the goblin breakeven).
 - Open: refit W on real PrizePicks lines at 300 graded rows; residual bias -0.07
   (top -0.15) was 2025 data (since 2026-03: +0.002).
