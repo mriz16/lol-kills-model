@@ -3,6 +3,7 @@ name: refit-calibration
 # Weekly (and manual) refit of the app's post-sim calibration: walk-forward backtest of the
 # live locked config on the match data of the `data` branch (uploaded in the app) with pmfs -> S (spread k) -> I (beta) -> W (lambda per market), then
 # commits data/calib_pairs.parquet, data/spread_rows.parquet, data/w_rows.parquet,
+# data/goblin_pairs.parquet (G, the goblin column's support map),
 # data/calib_params.json and reports/calibration_fit.md to main.
 # scripts/refit_calibration.py exits 1 (and writes nothing to data/) when the new fit
 # moved more than its drift limits vs the committed calib_params.json; the job then fails
@@ -51,7 +52,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/calib_pairs.parquet data/spread_rows.parquet data/w_rows.parquet \
-                  data/calib_params.json reports/calibration_fit.md
+                  data/goblin_pairs.parquet data/calib_params.json reports/calibration_fit.md
           if git diff --cached --quiet; then echo "no calibration changes"; exit 0; fi
           git commit -m "calibration: weekly S/I/W refit ($(date -u +%F))"
           for i in 1 2 3; do

@@ -25,7 +25,7 @@ PICK_COLUMNS = [
     "pick_id", "slip_id", "logged_at", "date", "platform", "n_legs", "stake", "payout",
     "slip_p_joint", "slip_ev", "league", "best_of", "matchup", "team", "opponent",
     "player", "role", "market", "line", "side", "p_more", "p_less", "p_push", "p_side",
-    "model_mean", "fair_line",
+    "model_mean", "fair_line", "mode", "kind",
 ]
 GRADED_COLUMNS = ["pick_id", "status", "actual", "series_id", "graded_at"]
 
@@ -169,8 +169,10 @@ def new_slip_id() -> str:
 
 
 def make_pick_rows(legs: list[dict], slip: dict, platform: str, stake: float,
-                   slip_id: str | None = None, now: datetime | None = None) -> list[dict]:
-    """Log rows for one played slip. legs are rows of the results table."""
+                   slip_id: str | None = None, now: datetime | None = None,
+                   mode: str = "power") -> list[dict]:
+    """Log rows for one played slip. legs are rows of the results table (goblin legs:
+    slate.goblin_row). mode "power" or "flex"."""
     now = now or datetime.now(timezone.utc)
     slip_id = slip_id or new_slip_id()
     rows = []
@@ -188,8 +190,15 @@ def make_pick_rows(legs: list[dict], slip: dict, platform: str, stake: float,
             p_push=round(float(r["p_push"]), 4),
             p_side=round(float(r["p_more"] if r["side"] == "more" else r["p_less"]), 4),
             model_mean=round(float(r["mean"]), 3), fair_line=float(r["fair_line"]),
+            mode=mode, kind=r.get("kind", "standard"),
         ))
     return rows
+
+
+def missing_picks(store, pick_ids) -> list[str]:
+    """Pick ids not in the stored log, read back after a write."""
+    have = set(read_picks(store)["pick_id"].astype(str))
+    return [str(x) for x in pick_ids if str(x) not in have]
 
 
 def append_picks(store, rows: list[dict], retries: int = 3) -> pd.DataFrame:

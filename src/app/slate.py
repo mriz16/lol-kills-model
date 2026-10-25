@@ -14,8 +14,9 @@ from src.app.names import LineMatch, match_lines
 from src.app.odds_input import odds_summary
 import json
 
-from src.engine.calibration import (Calibrator, calibrated_prop, fit_calibrator_asof,
-                                    fit_spread_asof, fit_w_asof, lambda_for, w_adjust)
+from src.engine.calibration import (Calibrator, GoblinCal, calibrated_prop,
+                                    fit_calibrator_asof, fit_goblin_asof, fit_spread_asof,
+                                    fit_w_asof, goblin_depth, lambda_for, w_adjust)
 from src.engine.features import (EngineConfig, History, MatchupParams, build_matchup,
                                  fit_kappa_by_position, locked_config)
 from src.engine.props import Leg, breakeven, prop_summary, slip_probability
@@ -38,6 +39,7 @@ CALIB_PATH = C.DATA_DIR / "calib_pairs.parquet"
 SPREAD_PATH = C.DATA_DIR / "spread_rows.parquet"
 W_PATH = C.DATA_DIR / "w_rows.parquet"
 W_REAL_PATH = C.DATA_DIR / "w_lambda_real.json"
+GOBLIN_PATH = C.DATA_DIR / "goblin_pairs.parquet"
 CALIB_MODEL = "L+O+S"
 CALIB_METHOD = "beta"
 # Minimum W-adjusted edge for a PLAY (reports/calibration_fit.md: after W the top-1/3/5
@@ -57,6 +59,11 @@ FLOOR_QS = (0.80, 0.90)
 SAFE_FLOOR_P = 0.85
 # SUP MORE: support overs at PP-like lines hit 55.8% at a shown 67.3% (n=267), below the
 # 2-pick breakeven; support unders were fine (68.2% at 70.5%).
+# Goblin column (reports/goblin_fit.md): for every standard line, the highest x.5 line
+# under it whose goblin P(more) >= goblin breakeven + MIN_EDGE. Goblin P = the S model
+# (sharp at lines 1-4 kills under a PP-like line), supports through their G map. The
+# default breakeven is the user's 6-pick goblin Power at 8.25x: 70.3% per leg.
+GOBLIN_MAX_DEPTH = 4
 
 
 def per_leg_breakeven(platform: str, legs: int) -> float:
@@ -71,7 +78,8 @@ class DataStore:
     def __init__(self, players: pd.DataFrame, teams: pd.DataFrame, asof=None,
                  calib_pairs: pd.DataFrame | None = None,
                  spread_rows: pd.DataFrame | None = None,
-                 w_rows: pd.DataFrame | None = None, w_real: dict | None = None):
+                 w_rows: pd.DataFrame | None = None, w_real: dict | None = None,
+                 goblin_pairs: pd.DataFrame | None = None):
         """asof (a date): backfill mode. Only games before that date (00:00 UTC) are kept,
         so pools, rosters, lineups, kappas and the S / I / W fits use prior data only.
         calib_pairs / spread_rows / w_rows / w_real default to the files in data/ (pass
@@ -97,6 +105,7 @@ class DataStore:
         self.calibrator = load_calibrator(self.cutoff, calib_pairs)
         self.spread_k = load_spread(self.cutoff, spread_rows)
         self.w_lambda, self.w_source = load_w(self.cutoff, w_rows, w_real)
+        self.goblin_cal = load_goblin(self.cutoff, goblin_pairs)
 
     @property
     def backfill(self) -> bool:
@@ -184,6 +193,15 @@ def load_w(cutoff, rows: pd.DataFrame | None = None, real: dict | None = None
     if lam.get("_n", 0) == 0 and lam["_pool"] == 1.0:
         return None, "none"
     return lam, "proxy lines"
+
+
+def load_goblin(cutoff, pairs: pd.DataFrame | None = None) -> GoblinCal:
+    """G: the goblin maps fitted on pairs of series >= 1 day before cutoff (no file: the
+    model's P for every position)."""
+    pairs = _read(pairs, GOBLIN_PATH)
+    if pairs is None or pairs.empty:
+        return GoblinCal()
+    return fit_goblin_asof(pairs, pd.Timestamp(cutoff))
 
 
 def _build_rosters(players: pd.DataFrame) -> dict[str, list[dict]]:
@@ -298,8 +316,8 @@ def run_matchup(store: DataStore, m: MatchupInput, legs: int, n_sims: int = C.N_
     sim.spread_k = getattr(store, "spread_k", None)
     res.sim = sim
     cal = getattr(store, "calibrator", None)
-    res.rows = [prop_row(res, lm, legs, cal, getattr(store, "w_lambda", None))
-                for lm in lines]
+    res.rows = [prop_row(res, lm, legs, cal, getattr(store, "w_lambda", None),
+                         getattr(store, "goblin_cal", None)) for lm in lines]
     return res
 
 
@@ -342,8 +360,74 @@ def floors(kills: np.ndarray, qs=FLOOR_QS) -> dict:
             for q in qs}
 
 
+def goblin_breakeven(legs: int = C.GOBLIN_DEFAULT_LEGS,
+                     payout: float = C.GOBLIN_DEFAULT_PAYOUT) -> float:
+    """Per-leg breakeven of an all-goblin Power slip: (1 / payout) ** (1 / legs)."""
+    return breakeven(float(payout), int(legs))
+
+
+def goblin_ladder(kills: np.ndarray, std_line: float, role: str,
+                  gcal: GoblinCal | None = None) -> list[dict]:
+    """Every x.5 line under the standard line, up to GOBLIN_MAX_DEPTH kills under:
+    [{line, depth, raw_p (S model P(more)), p (goblin P)}], highest line first."""
+    n = len(kills)
+    counts = np.bincount(np.asarray(kills, dtype=np.int64))
+    surv = 1.0 - np.cumsum(counts) / n                    # P(X > j)
+    top = np.ceil(float(std_line)) - 0.5                  # 4.5 -> 3.5, 4.0 -> 3.5
+    if top >= float(std_line):
+        top -= 1.0
+    out = []
+    line = top
+    while line > 0 and float(std_line) - line <= GOBLIN_MAX_DEPTH:
+        j = int(np.floor(line))
+        raw = float(surv[j]) if j < len(surv) else 0.0
+        p = float(gcal(raw, role)) if gcal is not None else raw
+        out.append(dict(line=float(line), depth=goblin_depth(std_line, line), raw_p=raw,
+                        p=p))
+        line -= 1.0
+    return out
+
+
+def goblin_pick(ladder, be: float, margin: float = MIN_EDGE) -> dict | None:
+    """The highest goblin line with P >= be + margin, or None."""
+    for g in ladder or []:
+        if g["p"] >= be + margin:
+            return g
+    return None
+
+
+def apply_goblin(df: pd.DataFrame, be: float) -> pd.DataFrame:
+    """gob_line / gob_p / gob_raw_p / gob_edge / gob_be columns for breakeven `be`."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    picks = [goblin_pick(lad, be) if isinstance(lad, list) else None
+             for lad in df.get("gob_ladder", [None] * len(df))]
+    df["gob_line"] = [g["line"] if g else np.nan for g in picks]
+    df["gob_p"] = [g["p"] if g else np.nan for g in picks]
+    df["gob_raw_p"] = [g["raw_p"] if g else np.nan for g in picks]
+    df["gob_be"] = be
+    df["gob_edge"] = df["gob_p"] - be
+    return df
+
+
+def goblin_row(r: dict, be: float) -> dict:
+    """The goblin line of a standard row as a row of its own (kind goblin, MORE): for
+    the slip and the slate log."""
+    g = dict(r)
+    line, p, raw = float(r["gob_line"]), float(r["gob_p"]), float(r["gob_raw_p"])
+    g.update(line=line, kind="goblin", side="more", p_more=p, p_less=1 - p, p_push=0.0,
+             p_side=p, breakeven=be, edge=p - be, cal_side="more", cal_p_more=p,
+             cal_p_less=1 - p, cal_p_push=0.0, cal_p_side=p, cal_edge=p - be,
+             raw_side="more", raw_p_more=raw, raw_p_less=1 - raw, raw_p_push=0.0,
+             raw_p_side=raw, raw_edge=raw - be, play=True, flags="GOBLIN",
+             leg_id=f"{r['matchup']}|{r['player']}|{line:g}|g")
+    return g
+
+
 def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
-             calibrator: Calibrator | None = None, w_lambda: dict | None = None) -> dict:
+             calibrator: Calibrator | None = None, w_lambda: dict | None = None,
+             goblin_cal: GoblinCal | None = None) -> dict:
     """One prop. Shown P / side / edge = W(I(model)) when a calibrator is given; cal_* =
     I only; raw_* = the model (with S when the sim carries spread_k)."""
     m, sim = res.inp, res.sim
@@ -381,6 +465,8 @@ def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
     row["flags"] = " ".join(flags_for(side, row["edge"], row["p_more"], row["line"], n_games,
                                       is_cal, lm.role, kind))
     row["why"] = explain(res, lm, row)
+    row["gob_ladder"] = goblin_ladder(kills, lm.line, lm.role, goblin_cal) \
+        if kind == "standard" else []
     return row
 
 
@@ -509,3 +595,49 @@ def _leg_p(p: dict, pre: str) -> float:
     """P of the leg's chosen side: pre "" shown (W), "cal_" calibrated, "raw_" raw. The
     leg's side may differ from the row's model side."""
     return float(p[pre + "p_" + ("more" if p["side"] == "more" else "less")])
+
+
+# --------------------------------------------------------------------- flex ----
+def poisson_binomial(ps) -> np.ndarray:
+    """P(k legs hit), k = 0..n, for independent legs."""
+    d = np.array([1.0])
+    for p in ps:
+        d = np.convolve(d, [1.0 - float(p), float(p)])
+    return d
+
+
+def hit_count_dist(sims: dict[str, SeriesSim], picks: list[dict]) -> np.ndarray:
+    """P(k legs hit) from the shared sims within a matchup, convolved across matchups."""
+    from src.engine.props import leg_hits
+    by: dict[str, list] = {}
+    for p in picks:
+        by.setdefault(p["matchup"], []).append(p)
+    d = np.array([1.0])
+    for key, group in by.items():
+        sim = sims[key]
+        hits = sum(leg_hits(sim, Leg(key, p["player"], p["market"], float(p["line"]),
+                                     "over" if p["side"] == "more" else "under")).astype(int)
+                   for p in group)
+        d = np.convolve(d, np.bincount(hits, minlength=len(group) + 1) / sim.n_sims)
+    return d
+
+
+def flex_summary(sims: dict[str, SeriesSim], picks: list[dict],
+                 table: dict[int, float] | None = None) -> dict:
+    """PrizePicks Flex: P(k hits) and EV, shown (independent legs at each leg's shown P),
+    calibrated and raw (shared sims). table = {hits: multiplier} (default by leg count)."""
+    n = len(picks)
+    table = table or C.PRIZEPICKS_FLEX.get(n)
+    out = {"n_legs": n, "table": table, "dist": None, "ev": None, "ev_cal": None,
+           "ev_raw": None}
+    if not table:
+        return out
+    dists = {"": poisson_binomial([_leg_p(p, "") for p in picks]),
+             "cal_": poisson_binomial([_leg_p(p, "cal_") for p in picks]),
+             "raw_": hit_count_dist(sims, picks)}
+    for pre, d in dists.items():
+        out[f"ev{'_' + pre.rstrip('_') if pre else ''}"] = float(
+            sum(d[k] * m for k, m in table.items() if k < len(d)) - 1.0)
+    out["dist"] = dists[""]
+    out["dist_raw"] = dists["raw_"]
+    return out

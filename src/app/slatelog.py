@@ -27,7 +27,7 @@ SLATE_COLUMNS = [
     "role", "line", "p_map", "calibrated", "side", "p_more", "p_less", "p_push", "p_side",
     "breakeven", "edge", "w_lambda", "cal_p_more", "cal_p_less", "cal_p_push", "cal_edge",
     "raw_side", "raw_p_more", "raw_p_less", "raw_p_push", "raw_edge", "k_spread", "mean", "median", "fair_line", "n_games", "share", "flags", "played",
-    "kind", "floor80", "floor90",
+    "kind", "floor80", "floor90", "gob_line", "gob_p", "gob_raw_p", "gob_be",
 ]
 SLATE_GRADED_COLUMNS = ["row_id", "status", "actual", "series_id", "graded_at"]
 
@@ -49,8 +49,11 @@ def _r(x, nd=4):
 
 
 def make_slate_rows(results: pd.DataFrame, slate_date: str, backfill: bool, cutoff,
-                    slate_id: str | None = None, now: datetime | None = None) -> list[dict]:
-    """Log rows for every prop of a run slate. `results` = slate.results_table rows."""
+                    slate_id: str | None = None, now: datetime | None = None,
+                    played: bool = False) -> list[dict]:
+    """Log rows for every prop of a run slate. `results` = slate.results_table rows (with
+    the goblin column, slate.apply_goblin, when present). played=True for goblin rows the
+    user logs as played (slate.goblin_row)."""
     now = now or datetime.now(timezone.utc)
     slate_id = slate_id or new_slate_id(now)
     cut = pd.Timestamp(cutoff).isoformat()
@@ -78,10 +81,25 @@ def make_slate_rows(results: pd.DataFrame, slate_date: str, backfill: bool, cuto
             mean=_r(r["mean"], 3),
             median=float(r["median"]), fair_line=float(r["fair_line"]),
             n_games=int(r["n_games"]), share=_r(r.get("share")), flags=r.get("flags", ""),
-            played=0, kind=r.get("kind", "standard"), floor80=r.get("floor80"),
-            floor90=r.get("floor90"),
+            played=int(bool(played)), kind=r.get("kind", "standard"),
+            floor80=r.get("floor80"), floor90=r.get("floor90"),
+            gob_line=_r(r.get("gob_line"), 1) if r.get("kind", "standard") == "standard"
+            else None,
+            gob_p=_r(r.get("gob_p")) if r.get("kind", "standard") == "standard" else None,
+            gob_raw_p=_r(r.get("gob_raw_p")) if r.get("kind", "standard") == "standard"
+            else None,
+            gob_be=_r(r.get("gob_be")),
         ))
     return out
+
+
+def missing_rows(store, row_ids, played: bool | None = None) -> list[str]:
+    """Row ids not found in the stored slate log (or found without played = 1 when
+    played=True): read back after a write, so the app only says "saved" when it is."""
+    df = read_slates(store)
+    have = df if played is None else df[df["played"].fillna(0).astype(int) == int(played)]
+    ids = set(have["row_id"].astype(str))
+    return [str(x) for x in row_ids if str(x) not in ids]
 
 
 def read_slates(store) -> pd.DataFrame:
@@ -157,6 +175,11 @@ def evaluate(slates: pd.DataFrame, graded: pd.DataFrame) -> dict:
            "n_void": int((d["status"] == "void").sum()), "rows": d}
     if done.empty:
         return out
+    out["goblin"] = goblin_eval(done)
+    if "kind" in done:      # goblin / demon rows are judged in the goblin table
+        done = done[done["kind"].fillna("standard").isin(["standard", ""])].copy()
+    if done.empty:
+        return out
     a, line = done["actual"].astype(float), done["line"].astype(float)
     done["over"] = (a > line).astype(int)
     done["under"] = (a < line).astype(int)
@@ -182,6 +205,48 @@ def evaluate(slates: pd.DataFrame, graded: pd.DataFrame) -> dict:
     out["calib"] = calibration_table(done["p_more"].astype(float), done["over"], 0.1)
     out["bias"] = float((done["mean"].astype(float) - a).mean())
     return out
+
+
+def goblin_eval(done: pd.DataFrame) -> pd.DataFrame:
+    """Graded goblins: the goblin column of every standard line (gob_line, gob_p) and the
+    goblin rows logged as played. n, predicted P(more), hit rate."""
+    rows = []
+    a = done["actual"].astype(float)
+    if "gob_line" in done:
+        m = done["gob_line"].notna() & done.get("kind", "standard").fillna("standard").eq(
+            "standard")
+        if m.any():
+            hit = (a[m] > done.loc[m, "gob_line"].astype(float)).astype(float)
+            rows.append(dict(group="goblin column", n=int(m.sum()),
+                             pred=float(done.loc[m, "gob_p"].astype(float).mean()),
+                             hit=float(hit.mean())))
+    if "kind" in done:
+        m = done["kind"].eq("goblin")
+        if m.any():
+            hit = (a[m] > done.loc[m, "line"].astype(float)).astype(float)
+            rows.append(dict(group="goblins played", n=int(m.sum()),
+                             pred=float(done.loc[m, "p_more"].astype(float).mean()),
+                             hit=float(hit.mean())))
+    t = pd.DataFrame(rows, columns=["group", "n", "pred", "hit"])
+    t["diff"] = t["hit"] - t["pred"]
+    return t
+
+
+def played_rows(slates: pd.DataFrame, graded: pd.DataFrame) -> pd.DataFrame:
+    """Every line marked played (standard and goblin), newest first, with its result:
+    hit / miss / push / pending / void for the side the model played."""
+    if slates.empty:
+        return slates
+    d = slates[slates["played"].fillna(0).astype(int) == 1].merge(
+        graded[["row_id", "status", "actual"]], on="row_id", how="left")
+    for c in ("line", "p_side", "actual"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    a, line = d["actual"].astype(float), d["line"].astype(float)
+    res = np.where(d["side"] == "more", a > line, a < line)
+    d["result"] = np.where(d["actual"].isna(), d["status"].fillna("pending"),
+                           np.where(a == line, "push", np.where(res, "hit", "miss")))
+    d.loc[d["status"].eq("void"), "result"] = "void"
+    return d.sort_values("logged_at", ascending=False).reset_index(drop=True)
 
 
 REAL_W_MIN_ROWS = 300
