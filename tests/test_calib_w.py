@@ -70,7 +70,8 @@ def test_build_params_write_and_drift(processed, fixture_rows, tmp_path):
     art = build(rows, players)
     assert art["PS"].shape == art["P0"].shape and np.allclose(art["PSI"].sum(axis=1), 1)
     assert {"lam", "p_more", "p_less", "p_push", "slate"} <= set(art["wrows"].columns)
-    assert set(art["pairs"]["model"]) == {"L+O", "L+O+S"}
+    assert set(art["pairs"]["model"]) == {"L+O", "L+O+H", "L+O+H+S"}
+    assert "form_rows" in art and {"_pool"} <= set(params_summary(art)["form_beta"])
     params = params_summary(art)
     assert {"spread_k", "w_lambda", "calib_pool", "min_edge_suggested"} <= set(params)
     files = write_artifacts(art, tmp_path, params)
@@ -105,7 +106,7 @@ def _pairs(n=20_000, distort=1.3):
     p = RNG.uniform(0.05, 0.95, n)
     return pd.DataFrame({"date": pd.Timestamp("2025-01-01"), "position": "mid",
                          "market": "Maps 1-2", "offset": 0.5, "p": p,
-                         "y": (RNG.random(n) < p ** distort).astype(int), "model": "L+O+S"})
+                         "y": (RNG.random(n) < p ** distort).astype(int), "model": "L+O+H+S"})
 
 
 def _spread_rows(k=1.3, n=2000):
@@ -119,7 +120,7 @@ def _store(processed, spread=None, w=None, real=None):
     return DataStore(players, teams, calib_pairs=_pairs(),
                      spread_rows=spread if spread is not None else pd.DataFrame(),
                      w_rows=w if w is not None else pd.DataFrame(),
-                     w_real=real if real is not None else {})
+                     w_real=real if real is not None else {}, form_rows=pd.DataFrame())
 
 
 def _run(store):

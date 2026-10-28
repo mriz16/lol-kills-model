@@ -14,8 +14,11 @@ import numpy as np
 import pandas as pd
 
 from src.config import PRIZEPICKS_POWER
-from src.engine.calibration import (Calibrator, GoblinCal, calibrate_pmf, fit_spread, fit_w,
-                                    goblin_pairs, inflate_pmf, pairs_from_rows, select_top)
+from src.app.research import prior_form
+from src.engine.calibration import (FORM_COLS, FORM_MIN_PREV, FORM_N_LAST, Calibrator,
+                                    GoblinCal, calibrate_pmf, fit_form, fit_spread, fit_w,
+                                    form_scale, goblin_pairs, inflate_pmf, pairs_from_rows,
+                                    scale_pmf, select_top)
 
 BE_2L = (1 / PRIZEPICKS_POWER[2]) ** 0.5
 N_MAPS = {"Map 1": 1, "Maps 1-2": 2, "Maps 1-3": 3}
@@ -23,6 +26,7 @@ PROXY_WINDOW, PROXY_MIN = 10, 5
 REFIT = pd.Timedelta(days=7)
 LAG = pd.Timedelta(days=1)
 CAL_METHOD = "beta"
+CALIB_MODEL = "L+O+H+S"        # the pmfs the app's I map is fitted on
 SPREAD_COLS = ["date", "position", "market", "y", "mean", "var"]
 W_COLS = ["date", "slate", "market", "position", "line", "p_more", "p_less", "p_push", "y"]
 
@@ -46,6 +50,49 @@ def load_rows(paths: list[Path]) -> dict[str, pd.DataFrame]:
 
 def stack(rows: pd.DataFrame) -> np.ndarray:
     return np.stack(rows["pmf"].to_numpy()).astype(float)
+
+
+# ------------------------------------------------------------------ H ----
+def form_rows(base: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
+    """base rows + avg_prev / n_prev (player's previous FORM_N_LAST series of the market)
+    + gap = avg_prev - mean, err = y - mean (gap NaN under FORM_MIN_PREV series)."""
+    parts = [prior_form(players, m, FORM_N_LAST).assign(market=m)
+             for m in base["market"].unique()]
+    pf = pd.concat(parts, ignore_index=True)
+    b = base.drop(columns=[c for c in ("avg_prev", "n_prev", "gap", "err") if c in base])
+    b = b.assign(series_id=b["series_id"].astype(str)).merge(
+        pf, on=["series_id", "player", "market"], how="left")
+    ok = b["n_prev"].fillna(0) >= FORM_MIN_PREV
+    b["gap"] = np.where(ok, b["avg_prev"] - b["mean"], np.nan)
+    b["err"] = b["y"] - b["mean"]
+    return b
+
+
+def apply_form(base: pd.DataFrame, P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """H: walk-forward beta per market (weekly refit on rows >= LAG before) -> each pmf
+    scaled by c = (mean + beta gap) / mean. Returns (pmfs, c per row)."""
+    out = P.copy()
+    cs = np.ones(len(base))
+    d = base["date"]
+    fit_rows = base[FORM_COLS]
+    for t in refit_dates(d):
+        sel = ((d >= t) & (d < t + REFIT)).to_numpy()
+        if not sel.any():
+            continue
+        table = fit_form(fit_rows[d <= t - LAG])
+        for i in np.flatnonzero(sel):
+            beta = table.get(base["market"].iat[i], table["_pool"])
+            c = form_scale(float(base["mean"].iat[i]), float(base["gap"].iat[i]), beta)
+            cs[i] = c
+            if c != 1.0:
+                out[i] = scale_pmf(P[i], c)
+    return out, cs
+
+
+def pmf_moments(P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    ks = np.arange(P.shape[1])
+    m = (P * ks).sum(axis=1)
+    return m, (P * ks ** 2).sum(axis=1) - m ** 2
 
 
 # ------------------------------------------------------------------ S and I ----
@@ -219,24 +266,32 @@ def derive_min_edge(wrows: pd.DataFrame, breakeven: float = BE_2L) -> tuple[floa
 # ------------------------------------------------------------------ artifacts ----
 def build(base: pd.DataFrame, players: pd.DataFrame) -> dict:
     """Everything the app and the reports need from the live locked variant's rows:
-    S pmfs, I-calibrated pmfs, W rows with walk-forward lambda, and the artifact frames."""
+    H pmfs (recent form), S pmfs on top, I-calibrated pmfs, W rows with walk-forward
+    lambda, and the artifact frames. S is fitted on the H means / variances."""
+    base = form_rows(base, players)
     P0 = stack(base)
-    PS, ks = apply_spread(base, P0)
+    PH, cs = apply_form(base, P0)
+    mh, vh = pmf_moments(PH)
+    base_raw = base
+    base = base.assign(mean=mh, var=vh)
+    PS, ks = apply_spread(base, PH)
     PSI = apply_calibration(base, PS, CAL_METHOD)
     prox = proxy_lines(players)
     b = base.drop(columns=[c for c in ("proxy_line", "proxy_mean") if c in base]).merge(
         prox, on=["series_id", "player", "market"], how="left")
     wrows, fits = apply_w(line_rows(b, PSI))
-    pairs = pd.concat([pairs_from_rows(base.assign(pmf=list(P))).assign(model=m)
-                       for m, P in (("L+O", P0), ("L+O+S", PS))], ignore_index=True)
+    pairs = pd.concat([pairs_from_rows(base_raw.assign(pmf=list(P))).assign(model=m)
+                       for m, P in (("L+O", P0), ("L+O+H", PH), ("L+O+H+S", PS))],
+                      ignore_index=True)
     pairs["p"] = pairs["p"].astype("float32")
     pairs["offset"] = pairs["offset"].astype("float32")
     pairs["y"] = pairs["y"].astype("int8")
     # G: goblin lines under the mean-based PP-like line, on the S pmfs (what the app's
     # goblin column reads); rows are aligned with b (same order as base)
     gob = goblin_pairs(b, PS, "proxy_mean")
-    return dict(P0=P0, PS=PS, PSI=PSI, ks=ks, base=b, wrows=wrows, w_fits=fits,
-                pairs=pairs, spread_rows=base[SPREAD_COLS].copy(), goblin_pairs=gob)
+    return dict(P0=P0, PH=PH, PS=PS, PSI=PSI, cs=cs, ks=ks, base=b, wrows=wrows,
+                w_fits=fits, pairs=pairs, spread_rows=base[SPREAD_COLS].copy(),
+                form_rows=base_raw[FORM_COLS].dropna().copy(), goblin_pairs=gob)
 
 
 def params_summary(art: dict, cutoff=None) -> dict:
@@ -247,7 +302,7 @@ def params_summary(art: dict, cutoff=None) -> dict:
     lim = cutoff - LAG
     sp = fit_spread(art["spread_rows"][art["spread_rows"]["date"] <= lim])
     pairs = art["pairs"]
-    cal = Calibrator.fit(pairs[(pairs["model"] == "L+O+S")
+    cal = Calibrator.fit(pairs[(pairs["model"] == CALIB_MODEL)
                                & (pd.to_datetime(pairs["date"]) <= lim)], CAL_METHOD)
     w = art["wrows"]
     lam = fit_w(w[pd.to_datetime(w["date"]) <= lim], BE_2L)
@@ -262,6 +317,9 @@ def params_summary(art: dict, cutoff=None) -> dict:
         if cal.pool is not None else None,
         "calib_grid": grid,
         "w_lambda": {k: (int(v) if k == "_n" else round(float(v), 4)) for k, v in lam.items()},
+        "form_beta": {k: round(float(v), 4) for k, v in fit_form(
+            art["form_rows"][pd.to_datetime(art["form_rows"]["date"]) <= lim]).items()}
+        if art.get("form_rows") is not None else {},
         "min_edge_suggested": derive_min_edge(w)[0],
         "goblin_maps": {pos: [round(float(x), 4) for x in m(np.array(grid))]
                         for pos, m in GoblinCal.fit(
@@ -303,8 +361,12 @@ def write_artifacts(art: dict, data_dir: Path, params: dict) -> list[Path]:
     w = art["wrows"][W_COLS].copy()
     for c in ("p_more", "p_less", "p_push"):
         w[c] = w[c].astype("float32")
+    fr = art.get("form_rows")
+    if fr is not None:
+        fr = fr.astype({"gap": "float32", "err": "float32"})
     for name, df in (("calib_pairs.parquet", art["pairs"]),
                      ("spread_rows.parquet", art["spread_rows"]), ("w_rows.parquet", w),
+                     ("form_rows.parquet", fr),
                      ("goblin_pairs.parquet", art.get("goblin_pairs"))):
         if df is None:
             continue

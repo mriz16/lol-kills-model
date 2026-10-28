@@ -65,6 +65,16 @@ for _n0 in (30, 100):
 # over the last 30 / 45 days only (reports/audit_unders.md).
 for _d in (30, 45):
     ALL_VARIANTS[f"L+O+E{_d}"] = EngineConfig(**LIVE_LOCKED_CFG, event_env_days=_d)
+# Projection toggles on the live locked config (2026-10-28, reports/backtest_proj.md):
+# R roster weighting, Q outcome-conditional kill share, F player form.
+for _r in (1, 2):
+    ALL_VARIANTS[f"L+O+R{_r}"] = EngineConfig(**LIVE_LOCKED_CFG, roster_power=_r)
+for _q in (10, 30):
+    ALL_VARIANTS[f"L+O+Q{_q}"] = EngineConfig(**LIVE_LOCKED_CFG, share_outcome_n0=_q)
+for _f in (20, 50):
+    ALL_VARIANTS[f"L+O+F{_f}"] = EngineConfig(**LIVE_LOCKED_CFG, form_halflife=_f)
+for _t in (15, 30):
+    ALL_VARIANTS[f"L+O+T{_t}"] = EngineConfig(**LIVE_LOCKED_CFG, team_halflife=_t)
 SPREAD_VARIANTS = [LIVE_LOCKED, "L+O+K30", "L+O+K100"]
 PMF_MAX = 64               # stored pmf support 0..PMF_MAX-1 (last bin = PMF_MAX-1 or more)
 G_VARIANTS = {"L+G"}

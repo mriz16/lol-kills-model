@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from src.config import N_SIMS, POSITIONS
-from src.engine.calibration import inflate_samples
+from src.engine.calibration import inflate_samples, scale_samples
 from src.engine.features import MatchupParams
 
 
@@ -22,6 +22,9 @@ class SeriesSim:
     # range_kills returns mean + k (x - mean) per sim (calibration.inflate_samples) with a
     # fixed seed per (player slot, market), so slips see the same inflated arrays.
     spread_k: dict | None = None
+    # H (recent form): {(player, market): c}; range_kills scales the player's total by c
+    # (stochastic rounding, fixed seed per slot and market) before S.
+    form: dict | None = None
 
     @property
     def n_sims(self) -> int:
@@ -38,6 +41,9 @@ class SeriesSim:
         s, j = self.player_index(player)
         lo, hi = parse_market(market, self.played.shape[1])
         k = self.player_kills[:, lo - 1:hi, s, j].sum(axis=1)
+        c = (self.form or {}).get((player, market), 1.0)
+        if c != 1.0:
+            k = scale_samples(k, float(c), rng=7000 + 1000 * (5 * s + j) + 10 * lo + hi)
         if self.spread_k:
             kk = self.spread_k.get((POSITIONS[j], market), self.spread_k.get("_pool", 1.0))
             k = inflate_samples(k, float(kk), rng=1000 * (5 * s + j) + 10 * lo + hi)
@@ -103,6 +109,11 @@ def simulate_series(params: MatchupParams, n_sims: int = N_SIMS,
     player_kills = np.zeros((S, M, 2, 5), dtype=np.int64)
     for s in (0, 1):
         g = rng.standard_gamma(params.alpha[s], size=(S, M, 5))
+        if params.alpha_wl is not None:     # toggle Q: shares by map outcome
+            won = a_wins if s == 0 else ~a_wins
+            g_w = rng.standard_gamma(params.alpha_wl[s, 1], size=(S, M, 5))
+            g_l = rng.standard_gamma(params.alpha_wl[s, 0], size=(S, M, 5))
+            g = np.where(won[:, :, None], g_w, g_l)
         if params.scale is not None:
             g = g * params.scale[s]
         shares = g / g.sum(axis=-1, keepdims=True)

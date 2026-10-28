@@ -14,13 +14,15 @@ from src.app.names import LineMatch, match_lines
 from src.app.odds_input import odds_summary
 import json
 
-from src.engine.calibration import (Calibrator, GoblinCal, calibrated_prop,
-                                    fit_calibrator_asof, fit_goblin_asof, fit_spread_asof,
-                                    fit_w_asof, goblin_depth, lambda_for, w_adjust)
+from src.app.research import recent_avg
+from src.engine.calibration import (FORM_MIN_PREV, FORM_N_LAST, Calibrator,
+                                    calibrated_prop, fit_calibrator_asof, fit_form_asof,
+                                    fit_spread_asof, fit_w_asof, form_scale, lambda_for,
+                                    w_adjust)
 from src.engine.features import (EngineConfig, History, MatchupParams, build_matchup,
                                  fit_kappa_by_position, locked_config)
 from src.engine.props import Leg, breakeven, prop_summary, slip_probability
-from src.engine.sim import SeriesSim, simulate_series
+from src.engine.sim import SeriesSim, parse_market, simulate_series
 
 PLATFORMS = {"PrizePicks": C.PRIZEPICKS_POWER, "Underdog": C.UNDERDOG}
 MARKET_BY_FORMAT = {1: "Map 1", 3: "Maps 1-2", 5: "Maps 1-3"}
@@ -30,6 +32,7 @@ LOW_SAMPLE_GAMES = 20
 CAUTION_P_MORE = 0.25       # "less" at a whole line with P(more) < 25%: overs hit ~9 pts more
 # Post-sim layers (reports/backtest_spread.md, reports/calibration_fit.md), all fitted
 # as of the store's cutoff from files written by scripts/refit_calibration.py:
+#  H (2026-10-28): recent-form mean shift beta per market <- data/form_rows.parquet
 #  S (locked 2026-10-14): spread k per position x market <- data/spread_rows.parquet
 #  I (display): beta calibration of P(over) on the S pmfs <- data/calib_pairs.parquet
 #  W (display): p_line + lambda (p_cal - p_line) per market <- data/w_rows.parquet, or
@@ -39,8 +42,8 @@ CALIB_PATH = C.DATA_DIR / "calib_pairs.parquet"
 SPREAD_PATH = C.DATA_DIR / "spread_rows.parquet"
 W_PATH = C.DATA_DIR / "w_rows.parquet"
 W_REAL_PATH = C.DATA_DIR / "w_lambda_real.json"
-GOBLIN_PATH = C.DATA_DIR / "goblin_pairs.parquet"
-CALIB_MODEL = "L+O+S"
+FORM_PATH = C.DATA_DIR / "form_rows.parquet"
+CALIB_MODEL = "L+O+H+S"
 CALIB_METHOD = "beta"
 # Minimum W-adjusted edge for a PLAY (reports/calibration_fit.md: after W the top-1/3/5
 # picks per slate are within ~1 pt of their shown P; 3 pts clears that by 2 se). Applies
@@ -48,7 +51,7 @@ CALIB_METHOD = "beta"
 MIN_EDGE = 0.03
 SIDE_BALANCE = 0.70         # warn when > 70% of a slate's plays are one side
 SIDE_BALANCE_MIN_PLAYS = 3
-# Floors and goblins (reports/audit_unders.md). floorNN = the most kills the player reaches
+# Floors (reports/audit_unders.md). floorNN = the most kills the player reaches
 # in NN% of sims (with S). In the walk-forward backtest P(X >= f) of the S pmfs is
 # calibrated to within ~1 pt from 80% to 98%, except supports (overstated 3-5 pts).
 FLOOR_QS = (0.80, 0.90)
@@ -59,11 +62,90 @@ FLOOR_QS = (0.80, 0.90)
 SAFE_FLOOR_P = 0.85
 # SUP MORE: support overs at PP-like lines hit 55.8% at a shown 67.3% (n=267), below the
 # 2-pick breakeven; support unders were fine (68.2% at 70.5%).
-# Goblin column (reports/goblin_fit.md): for every standard line, the highest x.5 line
-# under it whose goblin P(more) >= goblin breakeven + MIN_EDGE. Goblin P = the S model
-# (sharp at lines 1-4 kills under a PP-like line), supports through their G map. The
-# default breakeven is the user's 6-pick goblin Power at 8.25x: 70.3% per leg.
-GOBLIN_MAX_DEPTH = 4
+# The goblin finder (goblin column, Goblins tab, G map) was removed 2026-10-28 (user:
+# "predicting the goblins is useless"); typed goblin / demon lines stay MORE only.
+
+
+# Win / lose dependence (2026-10-28): whether a line hits depends mostly on who wins the
+# series (since 2026-03, players on series winners average 7.6 kills, losers 4.7; at the
+# median line the over hits 56% for winners, 30% for losers). Each line shows its P(hit)
+# if the player's team wins / loses the series, from the same sims. NEEDS WIN / NEEDS
+# LOSS when the gap is >= SCRIPT_GAP.
+SCRIPT_GAP = 0.20
+
+
+def series_a_wins(sim: SeriesSim) -> np.ndarray:
+    """(S,) bool: team A won the simulated series (BO1: map 1)."""
+    wa = (sim.a_wins & sim.played).sum(axis=1)
+    wb = (~sim.a_wins & sim.played).sum(axis=1)
+    return wa > wb
+
+
+def script_split(sim: SeriesSim, player: str, kills: np.ndarray, line: float,
+                 side: str) -> dict:
+    """P(MORE / LESS hits) if the player's team wins / loses the series, the team's series
+    win P, and for `side` (the shown pick): p_if_win, p_if_loss and needs = "win" (NEEDS
+    WIN), "loss" (NEEDS LOSS) or "" (either)."""
+    s, _ = sim.player_index(player)
+    won = series_a_wins(sim)
+    won = won if s == 0 else ~won
+    out = dict(p_team_series=float(won.mean()))
+    for name, hit in (("more", kills > line), ("less", kills < line)):
+        out[f"{name}_if_win"] = float(hit[won].mean()) if won.any() else np.nan
+        out[f"{name}_if_loss"] = float(hit[~won].mean()) if (~won).any() else np.nan
+    out["p_if_win"], out["p_if_loss"] = out[f"{side}_if_win"], out[f"{side}_if_loss"]
+    out["needs"] = needs_for(out, side)
+    return out
+
+
+def needs_for(r: dict, side: str) -> str:
+    """"win" / "loss" / "" for a leg on `side` of row r (needs the X_if_win columns)."""
+    w, l = r.get(f"{side}_if_win"), r.get(f"{side}_if_loss")
+    if w is None or l is None or not (np.isfinite(w) and np.isfinite(l)):
+        return ""
+    gap = float(w) - float(l)
+    return "win" if gap >= SCRIPT_GAP else ("loss" if gap <= -SCRIPT_GAP else "")
+
+
+def needs_team(r: dict) -> str | None:
+    """The team a leg (a row with its chosen side) is rooting for: its own team (NEEDS
+    WIN), the opponent (NEEDS LOSS), or None."""
+    n = needs_for(r, r["side"]) if f"{r.get('side')}_if_win" in r else (r.get("needs") or "")
+    return r["team"] if n == "win" else (r["opponent"] if n == "loss" else None)
+
+
+def slip_conflicts(legs: list[dict]) -> list[str]:
+    """Matchups where the slip's legs need different series winners."""
+    by: dict[str, set] = {}
+    for leg in legs:
+        t = needs_team(leg)
+        if t:
+            by.setdefault(leg["matchup"], set()).add(t)
+    return [f"{m}: legs need {' and '.join(sorted(ts))} to win" for m, ts in by.items()
+            if len(ts) > 1]
+
+
+def slip_by_winner(sims: dict[str, SeriesSim], picks: list[dict]) -> list[dict]:
+    """Per matchup in the slip: P(that matchup's legs all hit | each team wins the
+    series), raw model with S."""
+    from src.engine.props import leg_hits
+    out = []
+    by: dict[str, list] = {}
+    for p in picks:
+        by.setdefault(p["matchup"], []).append(p)
+    for key, group in by.items():
+        sim = sims[key]
+        joint = np.ones(sim.n_sims, dtype=bool)
+        for p in group:
+            joint &= leg_hits(sim, Leg(key, p["player"], p["market"], float(p["line"]),
+                                       "over" if p["side"] == "more" else "under"))
+        aw = series_a_wins(sim)
+        ta, tb = sim.params.teams
+        out.append(dict(matchup=key, legs=len(group), team_a=ta, team_b=tb,
+                        p_a=float(aw.mean()),
+                        hit_if_a=float(joint[aw].mean()) if aw.any() else np.nan,
+                        hit_if_b=float(joint[~aw].mean()) if (~aw).any() else np.nan))
+    return out
 
 
 def per_leg_breakeven(platform: str, legs: int) -> float:
@@ -79,7 +161,7 @@ class DataStore:
                  calib_pairs: pd.DataFrame | None = None,
                  spread_rows: pd.DataFrame | None = None,
                  w_rows: pd.DataFrame | None = None, w_real: dict | None = None,
-                 goblin_pairs: pd.DataFrame | None = None):
+                 form_rows: pd.DataFrame | None = None):
         """asof (a date): backfill mode. Only games before that date (00:00 UTC) are kept,
         so pools, rosters, lineups, kappas and the S / I / W fits use prior data only.
         calib_pairs / spread_rows / w_rows / w_real default to the files in data/ (pass
@@ -105,7 +187,7 @@ class DataStore:
         self.calibrator = load_calibrator(self.cutoff, calib_pairs)
         self.spread_k = load_spread(self.cutoff, spread_rows)
         self.w_lambda, self.w_source = load_w(self.cutoff, w_rows, w_real)
-        self.goblin_cal = load_goblin(self.cutoff, goblin_pairs)
+        self.form_beta = load_form(self.cutoff, form_rows)
 
     @property
     def backfill(self) -> bool:
@@ -195,13 +277,34 @@ def load_w(cutoff, rows: pd.DataFrame | None = None, real: dict | None = None
     return lam, "proxy lines"
 
 
-def load_goblin(cutoff, pairs: pd.DataFrame | None = None) -> GoblinCal:
-    """G: the goblin maps fitted on pairs of series >= 1 day before cutoff (no file: the
-    model's P for every position)."""
-    pairs = _read(pairs, GOBLIN_PATH)
-    if pairs is None or pairs.empty:
-        return GoblinCal()
-    return fit_goblin_asof(pairs, pd.Timestamp(cutoff))
+def load_form(cutoff, rows: pd.DataFrame | None = None) -> dict | None:
+    """H: {market: beta, "_pool": beta} from rows before cutoff; None = no file / no fit."""
+    rows = _read(rows, FORM_PATH)
+    if rows.empty:
+        return None
+    b = fit_form_asof(rows, pd.Timestamp(cutoff))
+    return b if any(v > 0 for v in b.values()) else None
+
+
+def form_factors(store, sim: SeriesSim, players: list[str], market: str) -> dict:
+    """H: {(player, market): c} from each player's last FORM_N_LAST series of the market
+    (>= FORM_MIN_PREV) vs the raw model mean of this sim."""
+    beta_t = getattr(store, "form_beta", None)
+    if not beta_t:
+        return {}
+    beta = beta_t.get(market, beta_t["_pool"])
+    out = {}
+    for pl in players:
+        avg, n = recent_avg(store.players, pl, market, FORM_N_LAST)
+        if n < FORM_MIN_PREV:
+            continue
+        s, j = sim.player_index(pl)
+        lo, hi = parse_market(market, sim.played.shape[1])
+        mean = float(sim.player_kills[:, lo - 1:hi, s, j].sum(axis=1).mean())
+        c = form_scale(mean, avg - mean, beta)
+        if c != 1.0:
+            out[(pl, market)] = c
+    return out
 
 
 def _build_rosters(players: pd.DataFrame) -> dict[str, list[dict]]:
@@ -312,18 +415,22 @@ def run_matchup(store: DataStore, m: MatchupInput, legs: int, n_sims: int = C.N_
     league = m.league or store.infer_league(m.team_a, m.team_b)
     sim, params = (sim_fn or simulate_matchup)(store, m, lines, odds, league, n_sims, seed)
     res = MatchupResult(m, league, odds, sim, params, lines)
-    # S is part of the locked model: every range_kills of this sim is inflated
+    # S is part of the locked model: every range_kills of this sim is inflated; H (recent
+    # form) scales each line player's total first
     sim.spread_k = getattr(store, "spread_k", None)
+    sim.form = form_factors(store, sim, list(dict.fromkeys(lm.player for lm in lines)),
+                            m.market)
     res.sim = sim
     cal = getattr(store, "calibrator", None)
-    res.rows = [prop_row(res, lm, legs, cal, getattr(store, "w_lambda", None),
-                         getattr(store, "goblin_cal", None)) for lm in lines]
+    res.rows = [prop_row(res, lm, legs, cal, getattr(store, "w_lambda", None))
+                for lm in lines]
     return res
 
 
 # --------------------------------------------------------------------- prop rows ----
 def flags_for(side: str, edge: float, p_more: float, line: float, n_games: int,
-              calibrated: bool = False, role: str = "", kind: str = "standard") -> list[str]:
+              calibrated: bool = False, role: str = "", kind: str = "standard",
+              needs: str = "") -> list[str]:
     """Calibrated: BELOW MIN under the minimum edge. Uncalibrated: THIN EDGE under 3 pts
     (and never a PLAY: the minimum edge applies only after calibration). Goblin / demon
     lines get their kind as a flag (MORE only, payout not in the edge)."""
@@ -342,6 +449,8 @@ def flags_for(side: str, edge: float, p_more: float, line: float, n_games: int,
         out.append("SAFE FLOOR")
     if side == "more" and role == "sup":
         out.append("SUP MORE")
+    if needs:
+        out.append(f"NEEDS {needs.upper()}")
     return out
 
 
@@ -360,74 +469,8 @@ def floors(kills: np.ndarray, qs=FLOOR_QS) -> dict:
             for q in qs}
 
 
-def goblin_breakeven(legs: int = C.GOBLIN_DEFAULT_LEGS,
-                     payout: float = C.GOBLIN_DEFAULT_PAYOUT) -> float:
-    """Per-leg breakeven of an all-goblin Power slip: (1 / payout) ** (1 / legs)."""
-    return breakeven(float(payout), int(legs))
-
-
-def goblin_ladder(kills: np.ndarray, std_line: float, role: str,
-                  gcal: GoblinCal | None = None) -> list[dict]:
-    """Every x.5 line under the standard line, up to GOBLIN_MAX_DEPTH kills under:
-    [{line, depth, raw_p (S model P(more)), p (goblin P)}], highest line first."""
-    n = len(kills)
-    counts = np.bincount(np.asarray(kills, dtype=np.int64))
-    surv = 1.0 - np.cumsum(counts) / n                    # P(X > j)
-    top = np.ceil(float(std_line)) - 0.5                  # 4.5 -> 3.5, 4.0 -> 3.5
-    if top >= float(std_line):
-        top -= 1.0
-    out = []
-    line = top
-    while line > 0 and float(std_line) - line <= GOBLIN_MAX_DEPTH:
-        j = int(np.floor(line))
-        raw = float(surv[j]) if j < len(surv) else 0.0
-        p = float(gcal(raw, role)) if gcal is not None else raw
-        out.append(dict(line=float(line), depth=goblin_depth(std_line, line), raw_p=raw,
-                        p=p))
-        line -= 1.0
-    return out
-
-
-def goblin_pick(ladder, be: float, margin: float = MIN_EDGE) -> dict | None:
-    """The highest goblin line with P >= be + margin, or None."""
-    for g in ladder or []:
-        if g["p"] >= be + margin:
-            return g
-    return None
-
-
-def apply_goblin(df: pd.DataFrame, be: float) -> pd.DataFrame:
-    """gob_line / gob_p / gob_raw_p / gob_edge / gob_be columns for breakeven `be`."""
-    if df is None or df.empty:
-        return df
-    df = df.copy()
-    picks = [goblin_pick(lad, be) if isinstance(lad, list) else None
-             for lad in df.get("gob_ladder", [None] * len(df))]
-    df["gob_line"] = [g["line"] if g else np.nan for g in picks]
-    df["gob_p"] = [g["p"] if g else np.nan for g in picks]
-    df["gob_raw_p"] = [g["raw_p"] if g else np.nan for g in picks]
-    df["gob_be"] = be
-    df["gob_edge"] = df["gob_p"] - be
-    return df
-
-
-def goblin_row(r: dict, be: float) -> dict:
-    """The goblin line of a standard row as a row of its own (kind goblin, MORE): for
-    the slip and the slate log."""
-    g = dict(r)
-    line, p, raw = float(r["gob_line"]), float(r["gob_p"]), float(r["gob_raw_p"])
-    g.update(line=line, kind="goblin", side="more", p_more=p, p_less=1 - p, p_push=0.0,
-             p_side=p, breakeven=be, edge=p - be, cal_side="more", cal_p_more=p,
-             cal_p_less=1 - p, cal_p_push=0.0, cal_p_side=p, cal_edge=p - be,
-             raw_side="more", raw_p_more=raw, raw_p_less=1 - raw, raw_p_push=0.0,
-             raw_p_side=raw, raw_edge=raw - be, play=True, flags="GOBLIN",
-             leg_id=f"{r['matchup']}|{r['player']}|{line:g}|g")
-    return g
-
-
 def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
-             calibrator: Calibrator | None = None, w_lambda: dict | None = None,
-             goblin_cal: GoblinCal | None = None) -> dict:
+             calibrator: Calibrator | None = None, w_lambda: dict | None = None) -> dict:
     """One prop. Shown P / side / edge = W(I(model)) when a calibrator is given; cal_* =
     I only; raw_* = the model (with S when the sim carries spread_k)."""
     m, sim = res.inp, res.sim
@@ -459,14 +502,14 @@ def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
         raw_p_less=s["p_under"], raw_p_push=s["p_push"], raw_p_side=raw_p,
         raw_edge=raw_p - be, n_games=int(n_games), share=float(share), p_map=p_map,
         kind=kind, **floors(kills),
+        **script_split(sim, lm.player, kills, float(lm.line), side),
+        form_c=float((sim.form or {}).get((lm.player, m.market), 1.0)),
     )
     # goblin / demon payouts are not the standard multiplier: never a PLAY on this edge
     row["play"] = bool(is_cal and row["edge"] >= MIN_EDGE and kind == "standard")
     row["flags"] = " ".join(flags_for(side, row["edge"], row["p_more"], row["line"], n_games,
-                                      is_cal, lm.role, kind))
+                                      is_cal, lm.role, kind, row["needs"]))
     row["why"] = explain(res, lm, row)
-    row["gob_ladder"] = goblin_ladder(kills, lm.line, lm.role, goblin_cal) \
-        if kind == "standard" else []
     return row
 
 
@@ -503,7 +546,9 @@ def explain(res: MatchupResult, lm: LineMatch, row: dict) -> str:
             f"losses ({res.league} env {info.get('target_env', float('nan')):.1f}); "
             f"{lm.player} ({lm.role}) takes {share} of team kills ({n} games); {adj}; "
             f"{lm.team} wins {p_map:.0%} of maps ({p_ser:.0%} series). "
-            f"Model mean {row['mean']:.1f} over {res.inp.market} vs line {row['line']:g}."
+            f"Model mean {row['mean']:.1f} over {res.inp.market} vs line {row['line']:g}"
+            + (f" (recent form x{row['form_c']:.2f}: last {FORM_N_LAST} series average "
+               "pulls the mean)" if row.get("form_c", 1.0) != 1.0 else "") + "."
             + raw)
 
 
@@ -517,7 +562,7 @@ def results_table(results: list[MatchupResult]) -> pd.DataFrame:
 
 
 def safest_overs(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
-    """Rows by shown P(more), highest first (goblins included): the slate's safest overs.
+    """Rows by shown P(more), highest first (typed goblins included): the slate's safest overs.
     Supports are kept but carry SUP MORE (their overs ran hot in the backtest)."""
     if df is None or df.empty:
         return pd.DataFrame()
@@ -536,9 +581,10 @@ def rebreakeven(df: pd.DataFrame, legs: int) -> pd.DataFrame:
     kind = df["kind"] if "kind" in df else pd.Series("standard", index=df.index)
     df["play"] = df["calibrated"].astype(bool) & (df["edge"] >= MIN_EDGE) & \
         (kind == "standard")
+    needs = df["needs"] if "needs" in df else pd.Series("", index=df.index)
     df["flags"] = [" ".join(flags_for(r.side, r.edge, r.p_more, r.line, r.n_games,
-                                      bool(r.calibrated), r.role, k))
-                   for r, k in zip(df.itertuples(), kind)]
+                                      bool(r.calibrated), r.role, k, nd if nd == nd else ""))
+                   for r, k, nd in zip(df.itertuples(), kind, needs)]
     return df.sort_values("edge", ascending=False).reset_index(drop=True)
 
 

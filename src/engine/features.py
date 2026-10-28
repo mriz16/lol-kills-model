@@ -58,6 +58,19 @@ class EngineConfig:
     #    which carry last year's edition. Same min(1, n/40) blend with the home-league
     #    prior. 0 = off (see reports/audit_unders.md).
     event_env_days: int = 0
+    # --- projection toggles tested 2026-10-28 (reports/backtest_proj.md), off by default ---
+    # R) roster weighting: each team-pool game's weight x (share of today's five starters
+    #    who played it) ** roster_power, so games of a previous roster count less.
+    roster_power: float = 0.0          # 0 = off
+    # Q) outcome-conditional kill share: share in wins / in losses, each shrunk toward the
+    #    overall share by n_o / (n_o + share_outcome_n0); the sim draws shares by outcome.
+    share_outcome_n0: float = 0.0      # 0 = off
+    # F) player form: kill-share weights x 0.5 ** (games back / form_halflife) on top of
+    #    the patch decay.
+    form_halflife: float = 0.0         # 0 = off
+    # T) team form: team-pool weights x 0.5 ** (team games back / team_halflife) on top of
+    #    the patch decay.
+    team_halflife: float = 0.0         # 0 = off
 
 
 def locked_config(**overrides) -> EngineConfig:
@@ -87,6 +100,9 @@ class MatchupParams:
     scale: np.ndarray | None = None
     # NB dispersion for the smoothed bootstrap; None = stochastic rounding
     nb_r: float | None = None
+    # toggle Q: (2 sides, 2 outcomes, 5) Dirichlet parameters by map outcome (1 = win);
+    # None = alpha for both outcomes
+    alpha_wl: np.ndarray | None = None
 
 
 class History:
@@ -104,6 +120,7 @@ class History:
         self.t_kills = t["teamkills"].values.astype(float)
         self.t_deaths = t["teamdeaths"].values.astype(float)
         self.t_len = t["gamelength"].values.astype(float) / 60.0
+        self.t_gameid = t["gameid"].astype(str).values
         self.team_idx = _index(self.t_team)
         self.league_idx = _index(self.t_league)
 
@@ -116,6 +133,10 @@ class History:
         self.p_pos = p["position"].astype(str).values
         self.p_league = p["league"].astype(str).values
         self.p_league_idx = _index(self.p_league)
+        self.p_gameid = p["gameid"].astype(str).values
+        self.p_team = p["teamname"].astype(str).values if "teamname" in p else None
+        self.p_result = p["result"].values.astype(np.int8) if "result" in p else None
+        self._game_rosters = None
         self.player_idx = _index(self.p_player)
         self.leagues = sorted(self.league_idx)
 
@@ -136,6 +157,18 @@ class History:
         idx = self._prior(idx, self.t_time, cutoff)
         keep, w = self._weights(self.t_patch[idx], patch, cfg)
         return idx[keep], w[keep]
+
+    def roster_overlap(self, idx: np.ndarray, team: str, lineup) -> np.ndarray:
+        """Toggle R: share of `lineup` (5 names) who played each team row idx (0..1)."""
+        if self._game_rosters is None:
+            ros: dict = {}
+            if self.p_team is not None:
+                for g, tm, pl in zip(self.p_gameid, self.p_team, self.p_player):
+                    ros.setdefault((g, tm), set()).add(pl)
+            self._game_rosters = ros
+        cur = set(lineup)
+        return np.array([len(cur & self._game_rosters.get((g, team), set())) / 5.0
+                         for g in self.t_gameid[idx]])
 
     def recent_rows(self, cutoff, patch, cfg, n=4000):
         end = np.searchsorted(self.t_time, cutoff, side="left")
@@ -286,14 +319,21 @@ class History:
         return {k: wt * loc[k] + (1 - wt) * glob[k] for k in C.POSITIONS}
 
     # ------------------------------------------------------------------ players ------
-    def player_share(self, player, cutoff, patch, cfg):
-        """(patch-weighted kill share over all games, n games)."""
+    def player_share(self, player, cutoff, patch, cfg, outcome=None):
+        """(patch-weighted kill share over all games, n games). outcome 1 / 0: wins /
+        losses only (toggle Q). cfg.form_halflife > 0: extra per-game decay (toggle F)."""
         idx = self.player_idx.get(player)
         if idx is None:
             return np.nan, 0
         idx = self._prior(idx, self.p_time, cutoff)
         keep, w = self._weights(self.p_patch[idx], patch, cfg)
         idx, w = idx[keep], w[keep]
+        if cfg.form_halflife > 0 and len(idx):
+            back = np.arange(len(idx))[::-1]
+            w = w * 0.5 ** (back / cfg.form_halflife)
+        if outcome is not None and self.p_result is not None:
+            sel = self.p_result[idx] == outcome
+            idx, w = idx[sel], w[sel]
         denom = np.sum(w * self.p_teamkills[idx])
         if len(idx) == 0 or denom <= 0:
             return np.nan, len(idx)
@@ -522,6 +562,12 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
 
         # (b)+(d) W/L pools, normalized by origin-league env, rescaled to target env
         idx, w = rows[s]
+        if cfg.team_halflife > 0 and len(idx):
+            w = w * 0.5 ** (np.arange(len(idx))[::-1] / cfg.team_halflife)
+        if cfg.roster_power > 0 and len(idx):
+            ov = hist.roster_overlap(idx, teams[s], lineups[s])
+            w = w * np.maximum(ov, 0.2) ** cfg.roster_power
+            info[f"roster_overlap_{s}"] = float(np.average(ov, weights=w))
         norm = hist.t_kills[idx] / env_of(hist.t_league[idx]) if len(idx) else np.empty(0)
         side_pools = [None, None]
         for outcome in (0, 1):
@@ -567,16 +613,27 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
     priors = hist.fitted_priors(league, cutoff, patch, cfg) if cfg.fit_priors \
         else cfg.position_priors
     info["position_priors"] = priors
+    alpha_wl = np.zeros((2, 2, 5)) if cfg.share_outcome_n0 > 0 else None
     for s in (0, 1):
         shares = np.zeros(5)
+        shares_wl = np.zeros((2, 5))
         for j, (pos, pl) in enumerate(zip(C.POSITIONS, lineups[s])):
             prior = priors[pos]
             obs, n = hist.player_share(pl, cutoff, patch, cfg)
             wt = min(1.0, n / cfg.shrink_games) if cfg.shrink_games > 0 else 1.0
             shares[j] = prior if np.isnan(obs) else wt * obs + (1 - wt) * prior
             info[f"share_{s}_{j}"] = (shares[j], n)
+            if alpha_wl is not None:
+                for o in (0, 1):
+                    so, no = hist.player_share(pl, cutoff, patch, cfg, outcome=o)
+                    lam = no / (no + cfg.share_outcome_n0)
+                    shares_wl[o, j] = shares[j] if np.isnan(so) else \
+                        wt * (lam * so + (1 - lam) * obs) + (1 - wt) * prior
         shares = np.clip(shares, 1e-3, None)
         shares = shares / shares.sum()
+        if alpha_wl is not None:
+            shares_wl = np.clip(shares_wl, 1e-3, None)
+            shares_wl = shares_wl / shares_wl.sum(axis=1, keepdims=True)
         if kpos is None:
             alpha[s] = cfg.kappa * shares
         else:
@@ -588,6 +645,9 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
                     info[f"kappa_{s}_{j}"] = (float(kv[j]), n_k)
             alpha[s] = kv * shares
             scale[s] = 1.0 / kv
+        if alpha_wl is not None:
+            alpha_wl[s] = shares_wl * (alpha[s].sum() / shares.sum() if kpos is None
+                                       else kv[None, :])
 
     nb_r = None
     if cfg.smooth_bootstrap:
@@ -597,7 +657,8 @@ def build_matchup(hist: History, team_a: str, team_b: str, league: str, best_of:
 
     return MatchupParams(teams=teams, best_of=best_of, p_map=float(p_map), pools=pools,
                          alpha=alpha, players=[list(lineups[0]), list(lineups[1])],
-                         script_mult=script, info=info, scale=scale, nb_r=nb_r)
+                         script_mult=script, info=info, scale=scale, nb_r=nb_r,
+                         alpha_wl=alpha_wl)
 
 
 def _opp_adj_by_outcome(hist, o_idx, o_w, g_idx, g_w, g_raw, env_raw, cfg) -> dict:

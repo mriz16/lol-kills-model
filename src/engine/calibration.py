@@ -266,6 +266,79 @@ def fit_spread_asof(rows: pd.DataFrame, cutoff,
     return fit_spread(rows[d <= pd.Timestamp(cutoff) - lag])
 
 
+# ------------------------------------------------------------------ H: recent form ----
+# H (2026-10-28, reports/backtest_form.md): the model under-reacts to a player's recent
+# output. gap = mean of the player's previous FORM_N_LAST series of the same market
+# (>= FORM_MIN_PREV of them) minus the model mean; actual - model mean rises ~0.25 per
+# kill of gap (Maps 1-2 / 1-3; Map 1 ~0.07). H scales the player's simulated market total
+# so its mean moves by beta * gap: x -> stochastic round(c x), c = (mean + beta gap) / mean,
+# beta per market = OLS slope of (y - mean) on gap over prior rows, clipped to [0, 1].
+# Applied before S. Walk-forward on 2026-03..10: CRPS -0.0115 (se 0.0027).
+FORM_N_LAST = 20
+FORM_MIN_PREV = 10
+FORM_MIN_ROWS = 500
+FORM_COLS = ["date", "market", "gap", "err"]
+
+
+def fit_form(rows: pd.DataFrame) -> dict:
+    """{market: beta, "_pool": beta} from rows with market, gap, err (= y - model mean).
+    Markets with < FORM_MIN_ROWS rows use the pooled beta; 0 under FORM_MIN_ROWS overall."""
+    rows = rows.dropna(subset=["gap", "err"])
+    if len(rows) < FORM_MIN_ROWS:
+        return {"_pool": 0.0}
+
+    def slope(g):
+        x, y = g["gap"].to_numpy(float), g["err"].to_numpy(float)
+        x = x - x.mean()
+        den = float(np.sum(x * x))
+        return float(np.clip(np.sum(x * (y - y.mean())) / den, 0.0, 1.0)) if den > 0 else 0.0
+
+    out = {"_pool": slope(rows)}
+    for mkt, g in rows.groupby("market"):
+        if len(g) >= FORM_MIN_ROWS:
+            out[mkt] = slope(g)
+    return out
+
+
+def fit_form_asof(rows: pd.DataFrame, cutoff,
+                  lag: pd.Timedelta = pd.Timedelta(days=1)) -> dict:
+    if rows is None or rows.empty:
+        return {"_pool": 0.0}
+    d = pd.to_datetime(rows["date"])
+    return fit_form(rows[d <= pd.Timestamp(cutoff) - lag])
+
+
+def form_scale(mean: float, gap: float, beta: float) -> float:
+    """c with c * mean = mean + beta * gap (target floored at 0.05 kills)."""
+    if not (np.isfinite(gap) and mean > 0) or beta == 0:
+        return 1.0
+    return float(max(mean + beta * gap, 0.05) / mean)
+
+
+def scale_samples(samples: np.ndarray, c: float, rng=0) -> np.ndarray:
+    """c x per sim, stochastically rounded (keeps sim order, so slips share arrays)."""
+    if c == 1.0:
+        return samples
+    rng = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+    x = np.maximum(c * np.asarray(samples, dtype=float), 0.0)
+    base = np.floor(x)
+    return (base + (rng.random(len(x)) < (x - base))).astype(np.int64)
+
+
+def scale_pmf(pmf: np.ndarray, c: float) -> np.ndarray:
+    """Exact distribution of scale_samples for a pmf on 0..len-1 (last bin absorbs)."""
+    if c == 1.0:
+        return pmf
+    n = len(pmf)
+    x = np.clip(c * np.arange(n), 0.0, n - 1)
+    lo = np.floor(x).astype(int)
+    frac = x - lo
+    out = np.zeros(n)
+    np.add.at(out, lo, pmf * (1 - frac))
+    np.add.at(out, np.minimum(lo + 1, n - 1), pmf * frac)
+    return out
+
+
 # ------------------------------------------------------------------ W: line shrinkage ----
 # Displayed P = p_line + lambda (p_cal - p_line). p_line is the line's push-adjusted implied
 # probability of a side: (1 - P(push)) / 2 (both sides priced alike). lambda per market is

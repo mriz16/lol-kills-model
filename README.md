@@ -2,10 +2,11 @@
 
 This app prices League of Legends player **kills** props (PrizePicks / Underdog). It uses a
 Monte Carlo series simulator (20,000 sims per series) built on Oracle's Elixir match data.
-The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off. See
+The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off, plus the
+post-sim H (recent form, 2026-10-28) and S (spread) layers. See
 `CLAUDE.md` for the full spec and `reports/` for the walk-forward backtests.
 
-- `streamlit_app.py`: the phone-first app, KILLCAST (Slate, Board, Goblins, Slip, Record, Scan tabs)
+- `streamlit_app.py`: the phone-first app, KILLCAST (Slate, Board, Players, Slip, Record, Scan tabs)
 - `src/engine/`: the simulator. `src/app/`: app logic (names, odds input, slate, OCR, pick
   log, grading).
 - Match data: you upload the Oracle's Elixir yearly CSV (or a .zip of it) at the top of
@@ -15,13 +16,17 @@ The model is locked to shrink30 + A + B50 + O, with game-script, C, M and P off.
   match data" below.
 - `.github/workflows/grade.yml`: runs three times a day. It grades logged picks and the
   slate log on the `picks-log` branch against the `data` branch parquet.
-- The sims carry the locked spread inflation S. Probabilities shown in the app are
+- The sims carry H (each player's total pulled toward their last-20-series average by a
+  fitted weight, `reports/backtest_form.md`) and the locked spread inflation S. Every line
+  also shows P(hit) if the player's team wins / loses the series, and the Players tab
+  compares the model's distribution with each player's real series (floors, ceilings,
+  boom / bust types). Probabilities shown in the app are
   calibrated (I, beta) and then shrunk toward the line (W: `p_line + λ (p_cal − p_line)`,
   λ per market). Calibrated-only and raw numbers are one tap away. A PLAY needs a shown
   edge of at least 3 points. See `reports/backtest_spread.md` and
   `reports/calibration_fit.md`.
 - `.github/workflows/calibrate.yml`: runs weekly (Mondays 11:07 UTC) and on demand. It
-  re-runs the walk-forward backtest and refits S / I / W (`scripts/refit_calibration.py`),
+  re-runs the walk-forward backtest and refits H / S / I / W (`scripts/refit_calibration.py`),
   then commits `data/calib_pairs.parquet`, `data/spread_rows.parquet`,
   `data/w_rows.parquet`, `data/calib_params.json` and `reports/calibration_fit.md`. If any
   parameter moves more than the drift limits (S k ±0.10, I map ±0.05, W λ ±0.25), the job
@@ -113,8 +118,7 @@ the app's data, so results show up as soon as the data has them.
 ### Slate log and backfill
 Every **Run projections** writes every entered line (played or not) to `logs/slates.csv` on the
 same branch, with all model outputs (calibrated and raw) and a `played` flag. Logging a
-slip, "Log lines as played" on the Board tab or "Log goblin plays" on the Goblins tab
-sets the flag (goblins get their own rows, kind goblin). Every write is read back before
+slip or "Log lines as played" on the Board tab sets the flag. Every write is read back before
 the app says it saved. The workflow grades
 every row into `logs/slates_graded.csv`; the Record tab shows the result. This is the
 real-world evaluation set.
