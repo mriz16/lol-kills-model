@@ -119,7 +119,6 @@ textarea:focus, input:focus { border-color: var(--cyan) !important;
   background: var(--accent, var(--cyan)); box-shadow: 0 0 14px var(--accent, var(--cyan)); }
 .kc-card.more { --accent: var(--cyan); }
 .kc-card.less { --accent: var(--magenta); }
-.kc-card.gob { --accent: var(--lime); }
 .kc-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
 .kc-name { font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 1.02rem;
   letter-spacing: .05em; color: #fff; }
@@ -230,32 +229,19 @@ def prop_card(r: dict, pre: str = "") -> str:
         f'</b></span><span>floor90 <b>{r.get("floor90", "–")}</b></span>'
         f'<span>median <b>{float(r["median"]):g}</b></span>'
         f'<span>{int(r.get("n_games") or 0)} gms</span></div>'
-        + (f'<div class="kc-tags">{"".join(tags)}</div>' if tags else "") + "</div>")
+        + _script_row(r) +
+        (f'<div class="kc-tags">{"".join(tags)}</div>' if tags else "") + "</div>")
 
 
-def goblin_card(r: dict, g: dict, be: float) -> str:
-    """A goblin pick: the standard line, the deepest-needed goblin line that is a play,
-    its P(more) against the goblin breakeven."""
-    tags = ['<span class="kc-tag play">GOBLIN PLAY</span>']
-    if r.get("role") == "sup":
-        tags.append('<span class="kc-tag">SUP</span>')
-    return (
-        f'<div class="kc-card gob"><div class="kc-top"><div>'
-        f'<div class="kc-name">{escape(str(r["player"]))}</div>'
-        f'<div class="kc-meta"><span class="kc-role">{escape(str(r["role"]))}</span>'
-        f'{escape(str(r["team"]))} vs {escape(str(r["opponent"]))}</div></div>'
-        f'<div class="kc-pick"><span class="kc-badge">MORE</span>'
-        f'<div class="kc-line">{float(g["line"]):g}<small> from {float(r["line"]):g}'
-        f'</small></div></div></div>'
-        + _bar(g["p"], be) +
-        f'<div class="kc-stats"><span>P <b>{pct(g["p"])}</b></span>'
-        f'<span>BE {pct(be)}</span>'
-        f'<span class="pos">{100 * (g["p"] - be):+.1f} pts</span>'
-        f'<span>proj <b>{float(r["mean"]):.1f}</b></span></div>'
-        f'<div class="kc-stats" style="margin-top:3px"><span>raw model <b>{pct(g["raw_p"])}'
-        f'</b></span><span>floor80 <b>{r.get("floor80", "–")}</b></span>'
-        f'<span>floor90 <b>{r.get("floor90", "–")}</b></span></div>'
-        f'<div class="kc-tags">{"".join(tags)}</div></div>')
+def _script_row(r: dict) -> str:
+    """P(the pick hits) if the player's team wins / loses the series (raw model)."""
+    w, l = r.get("p_if_win"), r.get("p_if_loss")
+    if w is None or l is None:
+        return ""
+    team = escape(str(r["team"]))
+    return (f'<div class="kc-stats" style="margin-top:3px"><span>hits <b>{pct(w, 0)}</b> if '
+            f'{team} wins</span><span><b>{pct(l, 0)}</b> if loses</span>'
+            f'<span>{team} series {pct(r.get("p_team_series"), 0)}</span></div>')
 
 
 def grid(cards: list[str]) -> str:

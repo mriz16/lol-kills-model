@@ -103,6 +103,11 @@ def simulate_series(params: MatchupParams, n_sims: int = N_SIMS,
     player_kills = np.zeros((S, M, 2, 5), dtype=np.int64)
     for s in (0, 1):
         g = rng.standard_gamma(params.alpha[s], size=(S, M, 5))
+        if params.alpha_wl is not None:     # toggle Q: shares by map outcome
+            won = a_wins if s == 0 else ~a_wins
+            g_w = rng.standard_gamma(params.alpha_wl[s, 1], size=(S, M, 5))
+            g_l = rng.standard_gamma(params.alpha_wl[s, 0], size=(S, M, 5))
+            g = np.where(won[:, :, None], g_w, g_l)
         if params.scale is not None:
             g = g * params.scale[s]
         shares = g / g.sum(axis=-1, keepdims=True)

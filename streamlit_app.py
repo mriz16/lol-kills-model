@@ -1,4 +1,4 @@
-"""KILLCAST: LoL player-kills props. Slate box -> Monte Carlo -> board, goblins, slips, log.
+"""KILLCAST: LoL player-kills props. Slate box -> Monte Carlo -> board, players, slips, log.
 
 Run locally:  streamlit run streamlit_app.py
 Deployed from `main` on Streamlit Community Cloud (see README.md).
@@ -19,13 +19,13 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from src import config as C  # noqa: E402
-from src.app import grading, picklog, slatelog, theme  # noqa: E402
+from src.app import grading, picklog, research, slatelog, theme  # noqa: E402
 from src.app.ocr import ocr_image, parse_board_text, props_to_lines  # noqa: E402
 from src.app.quick import insert_lines, parse_quick_slate, to_text  # noqa: E402
 from src.app.slate import (MARKET_BY_FORMAT, MIN_EDGE, PLATFORMS, DataStore,  # noqa: E402
-                           MatchupInput, apply_goblin, check_matchup, flex_summary,
-                           goblin_breakeven, goblin_row, lineups_for, per_leg_breakeven,
-                           rebreakeven, results_table, run_matchup, slip_summary)
+                           MatchupInput, check_matchup, flex_summary, lineups_for,
+                           per_leg_breakeven, rebreakeven, results_table, run_matchup,
+                           slip_by_winner, slip_conflicts, slip_summary)
 from src.data import databranch  # noqa: E402
 from src.data.upload import UploadError, process_upload  # noqa: E402
 from src.engine.features import build_matchup  # noqa: E402
@@ -77,8 +77,7 @@ def data_head(nonce: int) -> tuple[str | None, str | None]:
 
 def calib_version() -> str:
     files = [C.DATA_DIR / "calib_pairs.parquet", C.DATA_DIR / "spread_rows.parquet",
-             C.DATA_DIR / "w_rows.parquet", C.DATA_DIR / "w_lambda_real.json",
-             C.DATA_DIR / "goblin_pairs.parquet"]
+             C.DATA_DIR / "w_rows.parquet", C.DATA_DIR / "w_lambda_real.json"]
     return "-".join(str(int(f.stat().st_mtime)) + str(f.stat().st_size) for f in files
                     if f.exists())
 
@@ -178,8 +177,7 @@ def saved_note(n: int, what: str, remote: bool) -> None:
 
 
 def log_slate(store: DataStore, df: pd.DataFrame):
-    """Every line of a run slate goes to the slate log (played or not), with its goblin
-    column."""
+    """Every line of a run slate goes to the slate log (played or not)."""
     meta = ss()["slate_meta"]
     rows = slatelog.make_slate_rows(df, meta["slate_date"], store.backfill, store.cutoff,
                                     slate_id=meta["slate_id"])
@@ -199,22 +197,15 @@ def log_slate(store: DataStore, df: pd.DataFrame):
     ss()["slate_csv"] = pd.DataFrame(rows).to_csv(index=False)
 
 
-def save_played(rows: list[dict], goblins: list[dict]) -> bool:
-    """Standard legs: played flag on their slate-log rows. Goblin legs: their own
-    slate-log rows (kind goblin, played). Verified by reading the log back."""
+def save_played(rows: list[dict]) -> bool:
+    """Played flag on the legs' slate-log rows, verified by reading the log back."""
     log_store, remote = get_log_store()
-    meta = ss().get("slate_meta") or {}
     try:
-        if goblins:
-            grows = slatelog.make_slate_rows(pd.DataFrame(goblins), meta["slate_date"],
-                                             bool(meta.get("backfill")), store.cutoff,
-                                             slate_id=meta["slate_id"], played=True)
-            slatelog.append_slate(log_store, grows)
         ids = [r["row_id"] for r in rows]
         if ids:
             slatelog.mark_played(log_store, ids)
         ss()["log_nonce"] += 1
-        all_ids = ids + [slatelog.row_key(meta["slate_date"], g) for g in goblins]
+        all_ids = ids
         miss = slatelog.missing_rows(log_store, all_ids, played=True)
         if miss:
             st.error(f"{len(miss)} line(s) did not save as played (write returned OK, "
@@ -243,16 +234,10 @@ def init_state():
     ss().setdefault("data_nonce", 0)
     ss().setdefault("upload_summary", None)
     ss().setdefault("be_legs", 2)
-    ss().setdefault("gob_legs", C.GOBLIN_DEFAULT_LEGS)
-    ss().setdefault("gob_payout", C.GOBLIN_DEFAULT_PAYOUT)
 
 
 def be_legs() -> int:
     return int(ss().get("be_legs") or 2)
-
-
-def gob_be() -> float:
-    return goblin_breakeven(int(ss()["gob_legs"]), float(ss()["gob_payout"]))
 
 
 def html(s: str):
@@ -291,10 +276,9 @@ def slate_tab(store: DataStore):
                  label_visibility="collapsed",
                  help="One matchup line (TEAM vs TEAM, then the series moneylines; "
                       "optional bo1/bo3/bo5 and m1 + Map 1 moneylines), then its player "
-                      "lines. Add g after a line you already know is a goblin.")
+                      "lines. Add g after a goblin line (MORE only).")
     st.caption("`TEAM vs TEAM -150 +120` then `player line` under it · optional `bo1` · "
-               "`m1 -130 +110` for a Map 1 price · normal lines only: the Goblins tab "
-               "finds the goblin play for you.")
+               "`m1 -130 +110` for a Map 1 price.")
     parsed, loose = parsed_slate(store)
     ready = [p for p in parsed if not p[4] and p[2]]
     for msg in loose:
@@ -354,7 +338,7 @@ def run_slate(store: DataStore, inputs: list[MatchupInput]):
                 st.error(str(exc))
     if not results:
         return
-    df = apply_goblin(results_table(results), gob_be())
+    df = results_table(results)
     slate_date = (store.asof or pd.Timestamp.now(tz="UTC").tz_localize(None)).date()
     ss()["slate_meta"] = dict(slate_date=slate_date.isoformat(),
                               slate_id=slatelog.new_slate_id(), backfill=store.backfill)
@@ -363,7 +347,7 @@ def run_slate(store: DataStore, inputs: list[MatchupInput]):
     ss()["sims"] = {r.inp.key: r.sim for r in results}
     ss()["slate_saved"] = None
     st.success(f"{len(results)} matchup(s), {len(df)} lines projected in "
-               f"{time.time() - tic:.1f}s. Board and Goblins are ready.")
+               f"{time.time() - tic:.1f}s. Board and Players are ready.")
     log_slate(store, df)
 
 
@@ -375,7 +359,7 @@ def board_df() -> pd.DataFrame | None:
     df = ss().get("results")
     if df is None or df.empty:
         return None
-    df = apply_goblin(rebreakeven(df, be_legs()), gob_be())
+    df = rebreakeven(df, be_legs())
     ss()["results"] = df
     return df
 
@@ -402,7 +386,8 @@ def board_tab():
                  for l, k in zip(df["line"], df.get("kind", ["standard"] * len(df)))],
         "pick": df[f"{pre}side"].str.upper(), "P": 100 * df[f"{pre}p_side"],
         "edge": 100 * df[f"{pre}edge"], "proj": df["mean"], "fl80": df["floor80"],
-        "goblin": [f"{g:g}" if np.isfinite(g) else "" for g in df["gob_line"]],
+        "if W": 100 * df["p_if_win"], "if L": 100 * df["p_if_loss"],
+        "needs": df["needs"].map({"win": "W", "loss": "L"}).fillna(""),
         "team": df["team"],
     })
     ev = st.dataframe(
@@ -413,7 +398,16 @@ def board_tab():
                        "edge": st.column_config.NumberColumn("edge", format="%+.1f"),
                        "proj": st.column_config.NumberColumn("proj", format="%.1f"),
                        "fl80": st.column_config.NumberColumn("fl80", help="kills reached "
-                                                             "in 80% of sims")})
+                                                             "in 80% of sims"),
+                       "if W": st.column_config.NumberColumn(
+                           "if W", format="%.0f%%",
+                           help="model P(pick hits) if the player's team wins the series"),
+                       "if L": st.column_config.NumberColumn(
+                           "if L", format="%.0f%%",
+                           help="model P(pick hits) if the player's team loses the series"),
+                       "needs": st.column_config.TextColumn(
+                           "needs", help="W: the pick needs the team to win the series "
+                                         "(20+ pts better if it does); L: needs it to lose")})
     rows = ev.selection.rows if ev and ev.selection else []
     if rows:
         r = df.iloc[rows[0]].to_dict()
@@ -430,7 +424,8 @@ def board_tab():
         st.caption(f"{n_less} of {len(std)} standard lines lean LESS. At lines near a "
                    "player's average that is expected (kill counts are right-skewed); the "
                    "walk-forward check in reports/goblin_fit.md finds shown LESS plays "
-                   "68.4% → hit 68.5%, MORE 67.1% → 67.3%.")
+                   "68.4% → hit 68.5%, MORE 67.1% → 67.3%. if W / if L are raw model "
+                   "P(pick hits) given the series winner.")
     mark_played_ui(df)
 
 
@@ -440,65 +435,230 @@ def mark_played_ui(df: pd.DataFrame):
                 for r in df.itertuples()}
         picked = st.multiselect("Played", list(opts), key="played_pick")
         if st.button("Save as played", disabled=not picked, key="mark_played"):
-            save_played([df.loc[opts[k]].to_dict() for k in picked], [])
+            save_played([df.loc[opts[k]].to_dict() for k in picked])
 
 
-# ============================================================== goblins tab ====
-def goblin_rows(df: pd.DataFrame) -> pd.DataFrame:
-    g = df[df["gob_line"].notna()] if "gob_line" in df else df.iloc[0:0]
-    return g.sort_values("gob_edge", ascending=False)
+# ============================================================== players tab ====
+# validated categorical pair on the dark panel (dataviz validate_palette.js: lightness
+# band, CVD dE 25, normal-vision dE 28, >= 3:1 contrast)
+C_MODEL, C_ACTUAL = "#2a9be0", "#cf7f16"
+N_SERIES = {"last 10": 10, "last 20": 20, "last 40": 40, "all": None}
 
 
-def goblins_tab():
-    df = board_df()
+@st.cache_data(show_spinner="Measuring every player's spread...", max_entries=4)
+def archetype_table(version: str, asof: str | None) -> pd.DataFrame:
+    store_ = get_store(version, asof)
+    return research.archetypes(research.map_stats(store_.players))
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def series_totals(version: str, asof: str | None, player: str, market: str,
+                  team: str | None) -> pd.DataFrame:
+    return research.market_totals(get_store(version, asof).players, player, market, team)
+
+
+def model_kills(r: dict) -> np.ndarray | None:
+    sim = ss()["sims"].get(r["matchup"])
+    return None if sim is None else sim.range_kills(r["player"], r["market"])
+
+
+def slate_research(df: pd.DataFrame, n_last: int | None, arch: pd.DataFrame) -> pd.DataFrame:
+    """One row per slate line: model floors / ceilings (sims with S) next to the real
+    last-N series of the same market, over-rate at the line, in wins / losses."""
+    types = arch.set_index("player")["type"].to_dict() if len(arch) else {}
+    rows = []
+    for r in df.to_dict("records"):
+        k = model_kills(r)
+        m = research.dist_summary(k) if k is not None else {}
+        t = series_totals(VERSION, ASOF, r["player"], r["market"], None)
+        t = t.head(n_last) if n_last else t
+        a = research.dist_summary(t["kills"])
+        v, w = t["kills"].to_numpy(), t["won"].to_numpy(bool)
+        line = float(r["line"])
+        rows.append({
+            "player": r["player"], "role": r["role"], "line": line,
+            "type": types.get(r["player"], ""),
+            "m fl90": m.get("floor90"), "m fl80": m.get("floor80"),
+            "m med": m.get("median"), "m top20": m.get("ceil80"), "m top10": m.get("ceil90"),
+            "P over": 100 * float((k > line).mean()) if k is not None else np.nan,
+            "n": a["n"], "a fl80": a["floor80"], "a med": a["median"],
+            "a top10": a["ceil90"],
+            "over%": 100 * float((v > line).mean()) if len(v) else np.nan,
+            "over% W": 100 * float((v[w] > line).mean()) if w.any() else np.nan,
+            "over% L": 100 * float((v[~w] > line).mean()) if (~w).any() else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def dist_chart(t: pd.DataFrame, k: np.ndarray | None, line: float | None):
+    import altair as alt
+    d = research.pmf_compare(t["kills"], k)
+    if d.empty:
+        return None
+    d["share"] = 100 * d["share"]
+    bars = alt.Chart(d).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=9).encode(
+        x=alt.X("kills:O", title="kills"),
+        xOffset=alt.XOffset("source:N", sort=["actual", "model"]),
+        y=alt.Y("share:Q", title="% of series"),
+        color=alt.Color("source:N", sort=["actual", "model"],
+                        scale=alt.Scale(domain=["actual", "model"],
+                                        range=[C_ACTUAL, C_MODEL]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=[alt.Tooltip("source:N"), alt.Tooltip("kills:O"),
+                 alt.Tooltip("share:Q", format=".1f", title="% of series")])
+    out = bars
+    if line is not None:
+        rule = alt.Chart(pd.DataFrame({"kills": [str(int(np.ceil(line)))]})).mark_rule(
+            strokeDash=[4, 3], strokeWidth=2, color="#dce7ff").encode(x="kills:O")
+        out = bars + rule
+    return out.properties(height=230)
+
+
+def timeline_chart(t: pd.DataFrame, line: float | None):
+    import altair as alt
+    if t.empty:
+        return None
+    d = t.iloc[::-1].reset_index(drop=True)
+    d["n"] = np.arange(1, len(d) + 1)
+    d["result"] = np.where(d["won"], "won series", "lost series")
+    d["day"] = pd.to_datetime(d["date"]).dt.strftime("%Y-%m-%d")
+    bars = alt.Chart(d).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=10).encode(
+        x=alt.X("n:O", title="series (oldest → newest)", axis=alt.Axis(labels=False)),
+        y=alt.Y("kills:Q", title="kills"),
+        color=alt.Color("result:N", scale=alt.Scale(domain=["won series", "lost series"],
+                                                    range=[C_MODEL, C_ACTUAL]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=["day:N", "opponent:N", "result:N", "kills:Q", "league:N"])
+    out = bars
+    if line is not None:
+        out = bars + alt.Chart(pd.DataFrame({"y": [line]})).mark_rule(
+            strokeDash=[4, 3], strokeWidth=2, color="#dce7ff").encode(y="y:Q")
+    return out.properties(height=200)
+
+
+def players_tab(store: DataStore):
+    df = ss().get("results")
+    arch = archetype_table(VERSION, ASOF)
     c1, c2 = st.columns(2)
-    c1.number_input("Goblin slip legs", 2, 6, key="gob_legs", step=1)
-    c2.number_input("Goblin payout (x)", 1.0, 100.0, key="gob_payout", step=0.25,
-                    help="What PrizePicks shows for the all-goblin slip you build. "
-                         "6-pick at 8.25x = 70.3% per leg.")
-    be = gob_be()
-    html(theme.chips([theme.chip(f"goblin breakeven <b>{be:.1%}</b>"),
-                      theme.chip(f"play bar <b>{be + MIN_EDGE:.1%}</b>", "ok"),
-                      theme.chip("walk-forward: picks 79.0% → hit 79.4%")]))
-    if df is None:
-        html(theme.grid([]).replace("nothing clears the bar on this slate",
-                                    "run projections first"))
+    with c1:
+        win = st.segmented_control("Real series", list(N_SERIES), default="last 20",
+                                   key="res_n") or "last 20"
+    n_last = N_SERIES[win]
+    html(theme.chips([
+        theme.chip("m = model sims · a = actual " + win),
+        theme.chip("fl80 = reached in 80%"), theme.chip("top10 = reached in 10%"),
+    ]))
+    if df is not None and not df.empty:
+        html(theme.section("Slate distributions", "model vs what actually happened"))
+        t = slate_research(df, n_last, arch)
+        pc = st.column_config.NumberColumn(format="%.0f%%")
+        st.dataframe(t, hide_index=True, width="stretch",
+                     column_config={"P over": pc, "over%": pc, "over% W": pc,
+                                    "over% L": pc,
+                                    "line": st.column_config.NumberColumn(format="%g"),
+                                    "m med": st.column_config.NumberColumn(format="%g"),
+                                    "a med": st.column_config.NumberColumn(format="%g")})
+        st.caption("Model floors are the tested ones: in the walk-forward backtest P(kills ≥ "
+                   "floor) is calibrated within ~1 pt from 80% to 98% (supports 3-5 pts "
+                   "hot, reports/audit_unders.md). Actual columns are the player's real "
+                   "series of this market: small samples, every opponent and patch mixed.")
+        choices = list(dict.fromkeys(df["player"]))
+    else:
+        st.caption("Run a slate to compare the model with each player's real series. Any "
+                   "player can be looked up below.")
+        choices = []
+    html(theme.section("Player deep dive", "distribution, floors, every series"))
+    names = sorted(set(map(str, store.players["playername"].unique())))
+    # keyed per slate run, so a new slate starts on its own first player and market
+    run_key = (ss().get("slate_meta") or {}).get("slate_id", "none")
+    c1, c2 = st.columns(2)
+    with c1:
+        player = st.selectbox("Player", choices + [n for n in names if n not in choices],
+                              key=f"res_player_{run_key}",
+                              index=0 if choices or names else None)
+    row = df[df["player"] == player].iloc[0].to_dict() if choices and player in choices \
+        else None
+    with c2:
+        market = st.segmented_control("Market", list(research.MARKETS),
+                                      key=f"res_market_{run_key}",
+                                      default=row["market"] if row else "Map 1") or "Map 1"
+    if not player:
         return
-    g = goblin_rows(df)
-    html(theme.section(f"Goblin plays · {len(g)}",
-                       "highest x.5 line under each normal line that clears the bar"))
-    html(theme.grid([theme.goblin_card(r, dict(line=r["gob_line"], p=r["gob_p"],
-                                               raw_p=r["gob_raw_p"]), be)
-                     for r in g.to_dict("records")]))
-    if g.empty:
+    t_all = series_totals(VERSION, ASOF, player, market, None)
+    t = t_all.head(n_last) if n_last else t_all
+    k = model_kills(row) if row and row["market"] == market else None
+    line = float(row["line"]) if row and row["market"] == market else None
+    a = research.dist_summary(t["kills"])
+    w = t["won"].to_numpy(bool)
+    v = t["kills"].to_numpy()
+    me = arch[arch["player"] == player]
+    chips = [theme.chip(f"{a['n']} series · {market}")]
+    if len(me):
+        x = me.iloc[0]
+        if x["type"]:
+            chips.append(theme.chip(f"type <b>{theme.escape(x['type'])}</b>",
+                                    "warn" if x["type"] == "BOOM/BUST" else "ok"))
+        chips.append(theme.chip(f"per map {x['mean']:.1f} · wins {x['mean_win']:.1f} · "
+                                f"losses {x['mean_loss']:.1f}"))
+    if w.any() and (~w).any():
+        chips.append(theme.chip(f"series avg won <b>{v[w].mean():.1f}</b> · lost "
+                                f"<b>{v[~w].mean():.1f}</b>"))
+    html(theme.chips(chips))
+    if t.empty:
+        st.caption("No series of this market for this player.")
         return
-    with st.expander("Log goblin plays"):
-        opts = {f"{r['player']} MORE {r['gob_line']:g} G · {theme.pct(r['gob_p'])}": i
-                for i, r in g.iterrows()}
-        picked = st.multiselect("Goblins you played", list(opts), key="gob_pick")
-        st.caption("Logged as their own lines (kind goblin) in the slate log and graded "
-                   "like any other line. Build slips with them in the Slip tab.")
-        if st.button("Save goblins as played", disabled=not picked, key="gob_save"):
-            save_played([], [goblin_row(g.loc[opts[k]].to_dict(), be) for k in picked])
-    with st.expander("Full goblin ladder"):
-        rows = []
-        for r in df[df["kind"] == "standard"].to_dict("records"):
-            for x in r.get("gob_ladder") or []:
-                rows.append(dict(player=r["player"], role=r["role"], line=r["line"],
-                                 goblin=x["line"], P=100 * x["p"], raw=100 * x["raw_p"],
-                                 play="▶" if x["p"] >= be + MIN_EDGE else ""))
-        pc = st.column_config.NumberColumn(format="%.1f%%")
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
-                     column_config={"P": pc, "raw": pc})
+    summ = [dict(source=f"actual ({win})", **a)]
+    if k is not None:
+        summ.append(dict(source="model", **research.dist_summary(k)))
+    st.dataframe(pd.DataFrame(summ)[["source", "n", "floor90", "floor80", "median", "mean",
+                                     "ceil80", "ceil90", "max"]].rename(
+        columns={"ceil80": "top20", "ceil90": "top10"}), hide_index=True, width="stretch",
+        column_config={"mean": st.column_config.NumberColumn(format="%.1f"),
+                       "median": st.column_config.NumberColumn(format="%g")})
+    ch = dist_chart(t, k, line)
+    if ch is not None:
+        st.altair_chart(ch, width="stretch")
+    st.caption("Share of series at each kill count: actual (orange) vs the model's sims "
+               "(blue); dashed line = the line." if k is not None else
+               "Share of series at each kill count (run the slate to add the model).")
+    tl = timeline_chart(t, line)
+    if tl is not None:
+        st.altair_chart(tl, width="stretch")
+    lad = research.line_ladder(v, w, sim=k)
+    if line is not None:
+        lad = lad[(lad["line"] >= line - 4) & (lad["line"] <= line + 3)]
+    for c in ("over", "over_win", "over_loss", "model_over"):
+        if c in lad:
+            lad[c] = 100 * lad[c]
+    st.dataframe(lad.rename(columns={"over": "over %", "over_win": "in wins",
+                                     "over_loss": "in losses", "model_over": "model"}),
+                 hide_index=True, width="stretch",
+                 column_config={c: st.column_config.NumberColumn(format="%.0f%%")
+                                for c in ("over %", "in wins", "in losses", "model")})
+    with st.expander("Every series"):
+        st.dataframe(t[["date", "team", "opponent", "league", "best_of", "won", "kills"]],
+                     hide_index=True, width="stretch")
+    with st.expander("Boom / bust types by role"):
+        roles = st.multiselect("Roles", C.POSITIONS, default=C.POSITIONS, key="arch_roles")
+        show = arch[arch["role"].isin(roles)].sort_values(["role", "spread_pct"],
+                                                         ascending=[True, False])
+        st.dataframe(show[["player", "team", "role", "maps", "mean", "vmr", "floor80",
+                           "ceil90", "p_zero", "mean_win", "mean_loss", "type"]],
+                     hide_index=True, width="stretch",
+                     column_config={c: st.column_config.NumberColumn(format="%.2f")
+                                    for c in ("mean", "vmr", "p_zero", "mean_win",
+                                              "mean_loss")})
+        st.caption(f"Last {research.ARCHETYPE_DAYS} days, players with ≥ "
+                   f"{research.ARCHETYPE_MIN_MAPS} maps. vmr = variance / mean of kills per "
+                   "map (higher = more boom and bust for the same average). Types only for "
+                   "bot / mid / jng: there a player's spread carries over to the next 150 "
+                   "days (same type again 35-53% vs 33% by chance); for top and support it "
+                   "does not, so no type is shown (reports/player_research.md).")
 
 
 # ============================================================== slip tab ====
 def leg_options(df: pd.DataFrame) -> dict[str, dict]:
     opts = {}
-    be = gob_be()
-    for r in goblin_rows(df).to_dict("records"):
-        g = goblin_row(r, be)
-        opts[f"{g['player']} MORE {g['line']:g} G · {g['p_more']:.0%}"] = g
     for side_first in (True, False):
         for r in df.to_dict("records"):
             side = r["side"] if side_first else ("less" if r["side"] == "more" else "more")
@@ -517,7 +677,7 @@ def slip_tab():
         return
     opts = leg_options(df)
     picked = st.multiselect("Legs", list(opts), key="slip_legs",
-                            placeholder="Pick 2-6 legs (G = goblin line)")
+                            placeholder="Pick 2-6 legs")
     legs = [opts[k] for k in picked]
     if not legs:
         return
@@ -538,13 +698,13 @@ def slip_tab():
     special = any(l.get("kind", "standard") != "standard" for l in legs)
     payout = None
     if mode == "Power" and special:
-        # default: the goblin slip's per-leg multiplier to the power of the legs (6 legs
-        # at 8.25x -> 1.42x a leg); the user enters what PrizePicks shows
-        guess = float(ss()["gob_payout"]) ** (len(legs) / int(ss()["gob_legs"]))
+        # the user enters what PrizePicks shows for a slip with goblin / demon legs
+        guess = float(PLATFORMS[platform].get(len(legs), 1.0))
         payout = st.number_input("Payout PrizePicks shows (x)", min_value=1.0,
                                  value=round(guess, 2), step=0.25, key="slip_payout",
                                  help="Goblin legs lower the payout: enter the multiplier "
                                       "PrizePicks shows for this exact slip.")
+    script_ui(legs)
     if mode == "Power":
         s = slip_summary(ss()["sims"], legs, platform, payout)
         c1, c2, c3 = st.columns(3)
@@ -572,12 +732,30 @@ def slip_tab():
     if (ss().get("slate_meta") or {}).get("backfill"):
         st.caption("Backfill slate: legs are saved as played in the slate log only.")
         if st.button("Save legs as played", type="primary"):
-            save_played([l for l in legs if l.get("kind", "standard") != "goblin"],
-                        [l for l in legs if l.get("kind") == "goblin"])
+            save_played(legs)
         return
     stake = st.number_input("Entry ($)", min_value=0.0, value=10.0, step=5.0)
     if st.button("Log this slip", type="primary", disabled=not ok, width="stretch"):
         log_slip(legs, slip, platform, stake, mode.lower())
+
+
+def script_ui(legs: list[dict]):
+    """Which series results the slip needs: a conflict chip when legs in one matchup need
+    different winners, and P(all of a matchup's legs hit) by series winner."""
+    bad = slip_conflicts(legs)
+    html(theme.chips([theme.chip(f"conflict · <b>{theme.escape(c)}</b>", "bad") for c in bad]
+                     or [theme.chip("no conflicting series results", "ok")]))
+    rows = slip_by_winner(ss()["sims"], legs)
+    if rows:
+        st.dataframe(pd.DataFrame([{
+            "matchup": r["matchup"], "legs": r["legs"],
+            f"if A wins": 100 * r["hit_if_a"], f"if B wins": 100 * r["hit_if_b"],
+            "A series %": 100 * r["p_a"]} for r in rows]),
+            hide_index=True, width="stretch",
+            column_config={c: st.column_config.NumberColumn(c, format="%.0f%%")
+                           for c in ("if A wins", "if B wins", "A series %")})
+        st.caption("P(all of that matchup's legs hit) if team A (first team named) / team B "
+                   "wins the series, raw model. Legs that agree on one winner hit together.")
 
 
 def log_slip(legs: list[dict], slip: dict, platform: str, stake: float, mode: str):
@@ -592,8 +770,7 @@ def log_slip(legs: list[dict], slip: dict, platform: str, stake: float, mode: st
                      "Download it below and see Record → Log connection.")
         else:
             saved_note(len(rows), f"leg(s) of slip {rows[0]['slip_id']}", remote)
-        save_played([l for l in legs if l.get("kind", "standard") != "goblin"],
-                    [l for l in legs if l.get("kind") == "goblin"])
+        save_played(legs)
     except Exception as exc:
         st.error(f"Could not save the slip: {exc}. Download it below, and see Record → "
                  "Log connection.")
@@ -625,8 +802,8 @@ def record_tab(store: DataStore):
     played = slatelog.played_rows(slates, sgraded)
     html(theme.section(f"My plays · {len(played)}", "every line saved as played"))
     if played.empty:
-        st.caption("Nothing saved as played yet: Board → Log lines as played, Goblins → "
-                   "Log goblin plays, or Slip → Log this slip.")
+        st.caption("Nothing saved as played yet: Board → Log lines as played, or Slip → "
+                   "Log this slip.")
     else:
         res = played["result"].value_counts()
         c1, c2, c3 = st.columns(3)
@@ -836,13 +1013,13 @@ with st.expander("Data, mode and settings"):
     st.date_input("Slate date", key="backfill_date",
                   value=pd.Timestamp.now(tz="UTC").date() - timedelta(days=1),
                   max_value=pd.Timestamp.now(tz="UTC").date(), disabled=not backfill)
-tabs = st.tabs(["Slate", "Board", "Goblins", "Slip", "Record", "Scan"])
+tabs = st.tabs(["Slate", "Board", "Players", "Slip", "Record", "Scan"])
 with tabs[0]:
     slate_tab(store)
 with tabs[1]:
     board_tab()
 with tabs[2]:
-    goblins_tab()
+    players_tab(store)
 with tabs[3]:
     slip_tab()
 with tabs[4]:

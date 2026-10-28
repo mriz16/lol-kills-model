@@ -1,12 +1,11 @@
-"""Quick slate parser, goblin column, Flex payouts, played-line log."""
+"""Quick slate parser, goblin calibration (research), Flex payouts, played-line log."""
 import numpy as np
 import pandas as pd
 
 from src import config as C
 from src.app import grading, picklog, slatelog
 from src.app.quick import insert_lines, parse_quick_slate, to_text
-from src.app.slate import (apply_goblin, flex_summary, goblin_breakeven, goblin_ladder,
-                           goblin_pick, goblin_row, poisson_binomial)
+from src.app.slate import flex_summary, poisson_binomial
 from src.engine.calibration import GoblinCal, goblin_depth, goblin_pairs
 
 TEAMS = ["Hanwha Life Esports", "Gen.G", "T1", "Dplus Kia", "Bilibili Gaming",
@@ -45,19 +44,8 @@ def test_quick_slate_loose_lines_and_insert():
     assert ms[0].best_of == 1 and ms[0].lines == ["Faker 3.5"]
 
 
-def test_goblin_ladder_and_pick():
-    kills = np.repeat(np.arange(8), [5, 10, 15, 20, 20, 15, 10, 5])      # n = 100
-    lad = goblin_ladder(kills, 4.5, "mid")
-    assert [g["line"] for g in lad] == [3.5, 2.5, 1.5, 0.5]
-    assert [g["depth"] for g in lad] == [1, 2, 3, 4]
-    assert np.isclose(lad[0]["raw_p"], 0.50) and np.isclose(lad[1]["raw_p"], 0.70)
-    assert np.isclose(lad[2]["raw_p"], 0.85)
-    be = goblin_breakeven()
-    assert np.isclose(be, (1 / 8.25) ** (1 / 6))
-    assert goblin_pick(lad, be)["line"] == 1.5                 # 85% >= 73.3%, 70% < it
-    assert [g["line"] for g in goblin_ladder(kills, 4.0, "mid")][:1] == [3.5]
+def test_goblin_depth():
     assert goblin_depth(4.0, 3.5) == 1 and goblin_depth(4.5, 1.5) == 3
-    assert goblin_ladder(kills, 0.5, "sup") == []
 
 
 def test_goblin_cal_only_maps_supports():
@@ -91,20 +79,9 @@ def _row(**kw):
              w_lambda=0.9, cal_p_more=0.53, cal_p_less=0.47, cal_p_push=0.0, cal_edge=0.0,
              raw_side="more", raw_p_more=0.55, raw_p_less=0.45, raw_p_push=0.0,
              raw_edge=0.0, k_spread=1.0, n_games=50, share=0.24, p_map=0.5, kind="standard",
-             floor80=2, floor90=1, flags="", gob_ladder=[dict(line=2.5, depth=1, raw_p=0.7,
-                                                              p=0.7),
-                                                         dict(line=1.5, depth=2, raw_p=0.83,
-                                                              p=0.83)])
+             floor80=2, floor90=1, flags="")
     r.update(kw)
     return r
-
-
-def test_apply_goblin_and_goblin_row():
-    df = apply_goblin(pd.DataFrame([_row(), _row(player="Keria", gob_ladder=[])]), 0.703)
-    assert df["gob_line"].iloc[0] == 1.5 and np.isnan(df["gob_line"].iloc[1])
-    g = goblin_row(df.iloc[0].to_dict(), 0.703)
-    assert (g["line"], g["kind"], g["side"], g["p_more"]) == (1.5, "goblin", "more", 0.83)
-    assert np.isclose(g["edge"], 0.83 - 0.703)
 
 
 def test_poisson_binomial_and_flex_table():
@@ -144,23 +121,23 @@ def test_settle_flex_and_goblin_power():
 
 def test_played_rows_and_missing(tmp_path):
     store = picklog.LocalStore(tmp_path)
-    df = apply_goblin(pd.DataFrame([_row()]), 0.703)
+    df = pd.DataFrame([_row()])
     rows = slatelog.make_slate_rows(df, "2026-10-24", False, pd.Timestamp("2026-10-24"),
                                     slate_id="s1")
     slatelog.append_slate(store, rows)
     assert slatelog.missing_rows(store, [rows[0]["row_id"]]) == []
     assert slatelog.missing_rows(store, [rows[0]["row_id"]], played=True)
-    g = goblin_row(df.iloc[0].to_dict(), 0.703)
+    g = dict(_row(), line=1.5, kind="goblin", side="more", p_side=0.83)
     grow = slatelog.make_slate_rows(pd.DataFrame([g]), "2026-10-24", False,
                                     pd.Timestamp("2026-10-24"), slate_id="s1", played=True)
     slatelog.append_slate(store, grow)
     slates = slatelog.read_slates(store)
-    assert len(slates) == 2 and slates.loc[0, "gob_line"] == 1.5
+    assert len(slates) == 2 and slates["kind"].tolist() == ["standard", "goblin"]
     graded = pd.DataFrame({"row_id": slates["row_id"], "status": ["win", "win"],
                            "actual": [5, 5]})
     pr = slatelog.played_rows(slates, graded)
     assert list(pr["kind"]) == ["goblin"] and list(pr["result"]) == ["hit"]
     e = slatelog.evaluate(slates, graded)
     gob = e["goblin"].set_index("group")
-    assert gob.loc["goblin column", "hit"] == 1.0 and gob.loc["goblins played", "n"] == 1
+    assert gob.loc["goblins played", "n"] == 1
     assert e["table"]["n"].max() == 1          # the goblin row is not in the standard table
