@@ -16,7 +16,7 @@ A, B = "LCK Tigers", "LCK Ravens"
 @pytest.fixture(scope="module")
 def store(processed):
     return DataStore(*processed, calib_pairs=pd.DataFrame(), spread_rows=pd.DataFrame(),
-                     w_rows=pd.DataFrame(), w_real={})
+                     w_rows=pd.DataFrame(), w_real={}, form_rows=pd.DataFrame())
 
 
 @pytest.fixture(scope="module")
@@ -123,3 +123,57 @@ def test_projection_toggles_run(store, name):
     base = build_matchup(store.hist, A, B, "LCK", 3, 0.6, lu, store.cutoff, store.patch,
                          locked_config(kappa_pos=store.kappa_pos))
     assert base.alpha_wl is None
+
+
+def test_form_scale_and_fit():
+    from src.engine.calibration import fit_form, form_scale, scale_pmf, scale_samples
+    rng = np.random.default_rng(0)
+    x = rng.poisson(6, 200000)
+    c = form_scale(6.0, 2.0, 0.25)
+    assert c == pytest.approx(6.5 / 6.0)
+    s = scale_samples(x, c, rng=1)
+    assert s.mean() == pytest.approx(6.5, abs=0.03)
+    pmf = np.bincount(x, minlength=40)[:40] / len(x)
+    assert np.allclose(scale_pmf(pmf, c), np.bincount(s, minlength=40)[:40] / len(s),
+                       atol=0.004)
+    assert form_scale(6.0, np.nan, 0.3) == 1.0 and form_scale(6.0, 2.0, 0.0) == 1.0
+    gap = rng.normal(0, 2, 3000)
+    rows = pd.DataFrame({"market": ["Maps 1-2"] * 2000 + ["Map 1"] * 1000, "gap": gap,
+                         "err": 0.3 * gap + rng.normal(0, 1, 3000),
+                         "date": pd.Timestamp("2026-01-01")})
+    b = fit_form(rows)
+    assert b["Maps 1-2"] == pytest.approx(0.3, abs=0.05) and b["Map 1"] == pytest.approx(
+        0.3, abs=0.08)
+    assert fit_form(rows.head(100)) == {"_pool": 0.0}
+
+
+def test_prior_form_uses_only_earlier_series(processed):
+    players, _ = processed
+    name = str(players["playername"].iloc[0])
+    pf = research.prior_form(players, "Map 1", n_last=3)
+    mine = pf[pf["player"] == name]
+    t = research.market_totals(players, name, "Map 1").sort_values("date")
+    assert len(mine) == len(t)
+    m = mine.set_index("series_id").loc[t["series_id"]]
+    assert m["n_prev"].iloc[0] == 0 and m["n_prev"].iloc[-1] == min(3, len(t) - 1)
+    assert m["avg_prev"].iloc[-1] == pytest.approx(t["kills"].iloc[-4:-1].mean())
+
+
+def test_app_applies_form(processed):
+    players, teams = processed
+    st_ = DataStore(players, teams, calib_pairs=pd.DataFrame(), spread_rows=pd.DataFrame(),
+                    w_rows=pd.DataFrame(), w_real={},
+                    form_rows=pd.DataFrame({"date": pd.Timestamp("2000-01-01"),
+                                            "market": "Maps 1-2", "gap": np.arange(600.0),
+                                            "err": 0.5 * np.arange(600.0)}))
+    assert st_.form_beta["Maps 1-2"] == pytest.approx(0.5)
+    lu = st_.default_lineup(A)[:2]
+    m = MatchupInput(A, B, 3, "PrizePicks", "-150", "+125",
+                     lines="\n".join(f"{pl} 4.5" for pl in lu))
+    r = run_matchup(st_, m, legs=2, n_sims=4000)
+    assert r.sim.form and all(k[1] == "Maps 1-2" for k in r.sim.form)
+    for (pl, mk), c in r.sim.form.items():
+        raw = r.sim.player_kills[:, :2, *r.sim.player_index(pl)].sum(axis=1).mean()
+        avg, _ = research.recent_avg(st_.players, pl, mk)
+        assert c * raw == pytest.approx(raw + 0.5 * (avg - raw))
+        assert r.sim.range_kills(pl, mk).mean() == pytest.approx(c * raw, rel=0.02)

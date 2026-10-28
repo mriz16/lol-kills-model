@@ -321,7 +321,7 @@ def test_log_check_creates_branch_and_reports_errors():
 def store(processed):
     # no calibration pairs: raw probabilities, independent of data/calib_pairs.parquet
     return DataStore(*processed, calib_pairs=pd.DataFrame(), spread_rows=pd.DataFrame(),
-                     w_rows=pd.DataFrame(), w_real={})
+                     w_rows=pd.DataFrame(), w_real={}, form_rows=pd.DataFrame())
 
 
 def _fixture_matchup(store, lines=None):

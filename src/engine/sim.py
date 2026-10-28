@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from src.config import N_SIMS, POSITIONS
-from src.engine.calibration import inflate_samples
+from src.engine.calibration import inflate_samples, scale_samples
 from src.engine.features import MatchupParams
 
 
@@ -22,6 +22,9 @@ class SeriesSim:
     # range_kills returns mean + k (x - mean) per sim (calibration.inflate_samples) with a
     # fixed seed per (player slot, market), so slips see the same inflated arrays.
     spread_k: dict | None = None
+    # H (recent form): {(player, market): c}; range_kills scales the player's total by c
+    # (stochastic rounding, fixed seed per slot and market) before S.
+    form: dict | None = None
 
     @property
     def n_sims(self) -> int:
@@ -38,6 +41,9 @@ class SeriesSim:
         s, j = self.player_index(player)
         lo, hi = parse_market(market, self.played.shape[1])
         k = self.player_kills[:, lo - 1:hi, s, j].sum(axis=1)
+        c = (self.form or {}).get((player, market), 1.0)
+        if c != 1.0:
+            k = scale_samples(k, float(c), rng=7000 + 1000 * (5 * s + j) + 10 * lo + hi)
         if self.spread_k:
             kk = self.spread_k.get((POSITIONS[j], market), self.spread_k.get("_pool", 1.0))
             k = inflate_samples(k, float(kk), rng=1000 * (5 * s + j) + 10 * lo + hi)

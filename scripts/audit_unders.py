@@ -93,7 +93,7 @@ def bucket(d: pd.DataFrame, by: list[str], edges) -> pd.DataFrame:
 def shown_at_lines(rows: pd.DataFrame, PS: np.ndarray, line_col: str) -> pd.DataFrame:
     """The app's shown P (S pmf -> I beta -> W) at each row's PP-like line."""
     pairs = pd.read_parquet(DATA_DIR / "calib_pairs.parquet")
-    pairs = pairs[pairs["model"] == "L+O+S"]
+    pairs = pairs[pairs["model"].isin(["L+O+S", "L+O+H+S"])]
     t0 = rows["date"].min().normalize()
     cal = fit_calibrator_asof(pairs, t0, "beta")
     lam = fit_w_asof(pd.read_parquet(DATA_DIR / "w_rows.parquet"), t0, BE_2L)

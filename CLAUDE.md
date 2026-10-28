@@ -99,8 +99,19 @@ Run tests with `pytest`. Code lives in `src/` and is imported as `src.<pkg>`.
   player slot and market so slips share the arrays). k per position x market =
   sqrt(SSE / sum var) on prior backtest rows, shrunk to pooled (`SeriesSim.spread_k`,
   `calibration.inflate_samples`). Steps a-f are unchanged.
+- **H, recent-form blend (adopted 2026-10-28; user: "anything else you can do to improve
+  projections")**, applied after the sim and BEFORE S to each line player's market total:
+  x -> stochastic round(c x), c = (mean + beta gap) / mean, gap = mean of the player's
+  previous 20 series of the market (>= 10) minus the raw model mean; beta per market =
+  OLS slope of (y - mean) on gap over prior rows (>= 500), clipped [0, 1], refit weekly
+  (`calibration.fit_form`, `data/form_rows.parquet`, `SeriesSim.form`). Walk-forward
+  2026-03..10 (`reports/backtest_form.md`): H+S vs S CRPS -0.0072 (se 0.0015), log
+  -0.0033 (se 0.0011); beta ~0.15 Map 1, ~0.27 Maps 1-2 / 1-3; better in 6 of 8 months
+  (Oct 2026, mostly Worlds, +0.004 on 788 rows). Engine-side alternatives tested the same
+  day and NOT locked: R roster weighting, Q kill share by outcome, T team form (all within
+  noise), F player form in the kill share (worse, +0.013).
 - **Display layers (not part of the distribution)**: I = beta calibration of P(over) per
-  position x market (on the S pmfs), then W = `p_line + lambda (p_cal - p_line)` with
+  position x market (on the H+S pmfs, `CALIB_MODEL = "L+O+H+S"`), then W = `p_line + lambda (p_cal - p_line)` with
   p_line = (1 - P(push)) / 2, lambda per market fitted so the top-5 edges per slate are
   calibrated. **K rejected.** Minimum shown (W) edge for a PLAY: **3 pts**.
 
@@ -135,10 +146,12 @@ src/data/                   OE processing, upload parser + merge, data branch st
                             series inference, team aliases, synthetic gen
 src/engine/                 odds, history/features, sim, props/slips
 src/backtest/               elo, metrics, walk-forward runner
-src/engine/calibration.py   post-sim S (spread inflation), I (P(over) map), W (line shrinkage)
-src/backtest/calib_pipeline.py  walk-forward S/I/W pipeline, proxy lines, drift check
-src/app/                    app logic: names, quick (slate box), odds_input, slate (+ goblin
-                            column, Flex), theme (look), ocr, picklog, slatelog, grading
+src/engine/calibration.py   post-sim H (recent form), S (spread inflation), I (P(over) map),
+                            W (line shrinkage); G (goblin map, research only)
+src/backtest/calib_pipeline.py  walk-forward H/S/I/W pipeline, proxy lines, drift check
+src/app/                    app logic: names, quick (slate box), odds_input, slate (win/lose
+                            split, slip conflicts, Flex), research (Players tab), theme (look),
+                            ocr, picklog, slatelog, grading
 streamlit_app.py            Streamlit app (Phase 2)
 scripts/grade_picks.py      grade logs/picks.csv + logs/slates.csv on picks-log (grade.yml)
 scripts/spread_report.py    PIT / S / K / I / selection-bias study report
@@ -147,6 +160,9 @@ scripts/refit_calibration.py  backtest + S/I/W refit -> data/calib_pairs, spread
 scripts/refit_w_real.py     refit W's lambda on graded real PrizePicks lines (>= 300 rows)
 scripts/audit_unders.py     under-lean / floor / goblin audit -> reports/audit_unders_tables.md
 scripts/goblin_report.py    goblin column + side balance, walk-forward -> reports/goblin_fit.md
+                            (research only: the goblin finder left the app 2026-10-28)
+scripts/form_report.py      R/Q/F/T toggles + H walk-forward -> reports/backtest_form.md
+scripts/research_report.py  do boom/bust types carry over? -> reports/player_research.md
 packages.txt                apt packages for Streamlit Cloud (tesseract-ocr)
 tests/                      pytest (fixture in tests/fixtures/)
 ```
@@ -155,7 +171,8 @@ tests/                      pytest (fixture in tests/fixtures/)
 `src.engine.features.locked_config()` = shrink30 + A (per-position kappa) + B50 (n_eff
 floor 50) + O (outcome-conditional opp adj, fade nDef/10). Game-script off, C off, M off,
 P off. `locked_config() == ALL_VARIANTS["L+O"]` (`LIVE_LOCKED` in walkforward.py). The app
-uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
+uses only `locked_config()`, plus H and S on the sims (`DataStore.form_beta`,
+`DataStore.spread_k`).
 
 ## Phase 2 app (`streamlit_app.py`, logic in `src/app/`)
 - Look (2026-10-25, user: "an esports AI projection machine, not a sloppy terminal"):
@@ -164,7 +181,27 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   "Data through" per league and backfill live in the "Data, mode and settings" expander
   (`server.maxUploadSize = 600` MB in `.streamlit/config.toml`). The user dislikes
   warnings: prefer chips / captions over warning boxes, no new warnings.
-- Tabs: Slate, Board, Goblins, Slip, Record, Scan. Mobile-first (centered layout).
+- Tabs: Slate, Board, Players, Slip, Record, Scan. Mobile-first (centered layout).
+- Win / lose split (2026-10-28, user: overs only on goblins "always on the losing team",
+  unders blown up in one map): who wins the series decides most lines (since 2026-03,
+  winners' players average 7.6 kills vs 4.7; over at the median line 56% vs 30%; on the
+  user's Worlds lines unders hit 83% when the team lost, 40% when it won). The model was
+  checked to be unbiased by favourite / underdog (16,004 player-series, within ±0.1 kill
+  per win-prob bucket); Map 1 underdog goblins ~3 pts hot. Every line carries
+  `p_if_win` / `p_if_loss` (raw P(pick hits) given the team's series result, from the
+  same sims, `slate.script_split`) and NEEDS WIN / NEEDS LOSS when they differ by >= 20
+  pts. Slip: a chip when legs of one matchup need different series winners
+  (`slip_conflicts`) and P(all that matchup's legs hit) if each team wins (`slip_by_winner`).
+- Players tab (2026-10-28, user: "the 80% of matches goes over this", boom / bust vs safe
+  floor players, more research): per slate line the model's floor90 / floor80 / median /
+  top20 / top10 (sims with H+S) next to the player's real last-N series of the market
+  (floor80, median, top10, over % at the line overall / in wins / in losses); deep dive per
+  player with the actual-vs-model distribution chart, a series timeline coloured by series
+  result, the line ladder and every series (`src/app/research.py`). Boom / bust types =
+  per-map variance / mean vs role peers over 150 days, shown only for bot / mid / jng:
+  `reports/player_research.md` finds the same type again 35-55% (33% by chance) there and
+  ~chance for top / sup; the win / loss ratio does not carry over (numbers only, no label).
+  Chart colours #2a9be0 / #cf7f16, validated on the dark panel.
 - Slate: ONE text box for the whole slate (`src/app/quick.py`): a header
   `TEAM vs TEAM -150 +120` (optional `bo1/bo3/bo5`, `m1 -130 +110` Map 1 ML; "v" / "@"
   work; or one ML after each team), then that matchup's `player line` rows. Default
@@ -184,26 +221,16 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   W / G fits are as of the store's cutoff (backfill-safe). Flags as before (BELOW MIN,
   THIN EDGE, LOW SAMPLE, CAUTION, GOBLIN / DEMON, SAFE FLOOR, SUP MORE) show as tags; the
   side-balance warning box is gone.
-- Goblins (2026-10-25, user: "I enter normal lines; give me the goblin line that is a
-  play, paired with the actual breakeven"): for every standard line, `goblin_ladder` =
-  every x.5 line under it (up to 4 kills under) with goblin P(more); the goblin play =
-  the highest one with P >= goblin breakeven + `MIN_EDGE`. Goblin breakeven =
-  (1 / payout)^(1 / legs) from the tab's goblin slip legs / payout (default the user's
-  6-pick at 8.25x = 70.3%, play bar 73.3%). Goblin P = the S model (NOT W: it is sharp at
-  goblin lines), supports through G, a beta map fitted on `data/goblin_pairs.parquet`
-  (`calibration.GoblinCal`, refit weekly by calibrate.yml). Walk-forward
-  (`reports/goblin_fit.md`, `scripts/goblin_report.py`): picks at the bar predicted 79.0%,
-  hit 79.4% (n=11,660); supports raw 81.2% -> 79.1% hit, fixed by G. Every standard row
-  logs its goblin column (`gob_line`, `gob_p`, `gob_raw_p`, `gob_be`); "Log goblin plays"
-  saves chosen goblins as their own slate-log rows (kind goblin, played).
-- Slip: legs = goblin plays (G) + both sides of every line. Power: joint P from shared
+- Goblin finder REMOVED (2026-10-28, user: "predicting the goblins is useless, so dump
+  that"): no Goblins tab, goblin column, ladder or G map in the app. Old slate-log rows keep
+  their gob_* columns; `GoblinCal` / goblin_pairs stay for research (`reports/goblin_fit.md`).
+- Slip: legs = both sides of every line. Power: joint P from shared
   sims within a matchup, multiplied across; shown (and calibrated) joint = raw joint x each
-  leg's shown (calibrated) / raw P, capped at the weakest leg; a slip with goblin legs
-  takes the payout PrizePicks shows (default guess: the goblin slip's per-leg multiplier).
+  leg's shown (calibrated) / raw P, capped at the weakest leg; a slip with typed goblin /
+  demon legs takes the payout PrizePicks shows.
   Flex (PrizePicks 3-6 legs, `C.PRIZEPICKS_FLEX`, 5-pick 10x / 2x / 0.4x): P(k hits) from
   independent shown legs (raw: shared sims), EV from the table. Logging a slip writes
-  `logs/picks.csv` (mode, kind columns) and marks its legs played (goblin legs as goblin
-  rows). Settlement: Flex by the table ("partial" when it returns < stake); a full Power
+  `logs/picks.csv` (mode, kind columns) and marks its legs played. Settlement: Flex by the table ("partial" when it returns < stake); a full Power
   slip with a goblin / demon leg pays its logged payout.
 - Record: "My plays" (every slate-log line marked played, standard and goblin, with
   hit / miss / pending), slips (W-L, ROI), model check (standard table + goblin table),
@@ -220,7 +247,7 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   toward 300 for `scripts/refit_w_real.py`; its `data/w_lambda_real.json` replaces the
   proxy-line lambda for cutoffs after its last slate).
 - Weekly `calibrate.yml` (+ manual, `force` input) reruns `scripts/refit_calibration.py`
-  and commits the S / I / W data; fails without committing if S k moves > 0.10, the I
+  and commits the H / S / I / W data (`data/form_rows.parquet` for H); fails without committing if S k moves > 0.10, the I
   map > 0.05 or a W lambda > 0.25 vs `data/calib_params.json`.
 - Backfill mode: `DataStore(asof=date)` keeps only games before 00:00 UTC of the date
   (pools, rosters, lineups, kappas, calibrator); rows logged with `backfill = 1`; slips
@@ -336,5 +363,10 @@ uses only `locked_config()`, plus S on the sims (`DataStore.spread_k`).
   not changed (P toggle was score-neutral; needs sign-off). User's 2026-10-24 Worlds
   slips: unders flex 3/5 (model ~64% a leg), goblin power 5/6 (JiaQi 4.5 missed; model
   had Supa / Ruler / JiaQi goblins at 49-58%, below the goblin breakeven).
+- 2026-10-28: user lost money and distrusts the model; asked for research tools, not
+  claims. First real-line check (96 graded Worlds lines 10-24/25): model side 56-40
+  (58.3%, shown 53.3%), PLAYs 9-3; too small to prove anything (±10 pts). Goblin finder
+  removed, win / lose split + Players tab added, H adopted (see Engine). Always show the
+  evidence and its sample size; say plainly when something is noise.
 - Open: refit W on real PrizePicks lines at 300 graded rows; residual bias -0.07
   (top -0.15) was 2025 data (since 2026-03: +0.002).

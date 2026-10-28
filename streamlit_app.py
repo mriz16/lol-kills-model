@@ -77,7 +77,8 @@ def data_head(nonce: int) -> tuple[str | None, str | None]:
 
 def calib_version() -> str:
     files = [C.DATA_DIR / "calib_pairs.parquet", C.DATA_DIR / "spread_rows.parquet",
-             C.DATA_DIR / "w_rows.parquet", C.DATA_DIR / "w_lambda_real.json"]
+             C.DATA_DIR / "w_rows.parquet", C.DATA_DIR / "w_lambda_real.json",
+             C.DATA_DIR / "form_rows.parquet"]
     return "-".join(str(int(f.stat().st_mtime)) + str(f.stat().st_size) for f in files
                     if f.exists())
 
@@ -508,7 +509,8 @@ def dist_chart(t: pd.DataFrame, k: np.ndarray | None, line: float | None):
                  alt.Tooltip("share:Q", format=".1f", title="% of series")])
     out = bars
     if line is not None:
-        rule = alt.Chart(pd.DataFrame({"kills": [str(int(np.ceil(line)))]})).mark_rule(
+        # ordinal axis: the rule sits on the first kill count over the line
+        rule = alt.Chart(pd.DataFrame({"kills": [int(np.ceil(line))]})).mark_rule(
             strokeDash=[4, 3], strokeWidth=2, color="#dce7ff").encode(x="kills:O")
         out = bars + rule
     return out.properties(height=230)
@@ -995,6 +997,8 @@ age = (pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timestamp(store.last_da
 src_kind = VERSION.split("|")[0].split(":")[0]
 cal = ("S · I · W" if store.calibrated else "uncalibrated") if store.spread_k else \
     ("I · W" if store.calibrated else "uncalibrated")
+if store.form_beta and store.calibrated:
+    cal = "H · " + cal
 html(theme.hero(f"LoL KILL PROJECTION ENGINE · <b>{C.N_SIMS:,}</b> SIMS / SERIES"))
 html(theme.chips([
     theme.chip(f"data <b>{store.last_date:%Y-%m-%d}</b>",

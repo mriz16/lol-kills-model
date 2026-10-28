@@ -14,12 +14,15 @@ from src.app.names import LineMatch, match_lines
 from src.app.odds_input import odds_summary
 import json
 
-from src.engine.calibration import (Calibrator, calibrated_prop, fit_calibrator_asof,
-                                    fit_spread_asof, fit_w_asof, lambda_for, w_adjust)
+from src.app.research import recent_avg
+from src.engine.calibration import (FORM_MIN_PREV, FORM_N_LAST, Calibrator,
+                                    calibrated_prop, fit_calibrator_asof, fit_form_asof,
+                                    fit_spread_asof, fit_w_asof, form_scale, lambda_for,
+                                    w_adjust)
 from src.engine.features import (EngineConfig, History, MatchupParams, build_matchup,
                                  fit_kappa_by_position, locked_config)
 from src.engine.props import Leg, breakeven, prop_summary, slip_probability
-from src.engine.sim import SeriesSim, simulate_series
+from src.engine.sim import SeriesSim, parse_market, simulate_series
 
 PLATFORMS = {"PrizePicks": C.PRIZEPICKS_POWER, "Underdog": C.UNDERDOG}
 MARKET_BY_FORMAT = {1: "Map 1", 3: "Maps 1-2", 5: "Maps 1-3"}
@@ -29,6 +32,7 @@ LOW_SAMPLE_GAMES = 20
 CAUTION_P_MORE = 0.25       # "less" at a whole line with P(more) < 25%: overs hit ~9 pts more
 # Post-sim layers (reports/backtest_spread.md, reports/calibration_fit.md), all fitted
 # as of the store's cutoff from files written by scripts/refit_calibration.py:
+#  H (2026-10-28): recent-form mean shift beta per market <- data/form_rows.parquet
 #  S (locked 2026-10-14): spread k per position x market <- data/spread_rows.parquet
 #  I (display): beta calibration of P(over) on the S pmfs <- data/calib_pairs.parquet
 #  W (display): p_line + lambda (p_cal - p_line) per market <- data/w_rows.parquet, or
@@ -38,7 +42,8 @@ CALIB_PATH = C.DATA_DIR / "calib_pairs.parquet"
 SPREAD_PATH = C.DATA_DIR / "spread_rows.parquet"
 W_PATH = C.DATA_DIR / "w_rows.parquet"
 W_REAL_PATH = C.DATA_DIR / "w_lambda_real.json"
-CALIB_MODEL = "L+O+S"
+FORM_PATH = C.DATA_DIR / "form_rows.parquet"
+CALIB_MODEL = "L+O+H+S"
 CALIB_METHOD = "beta"
 # Minimum W-adjusted edge for a PLAY (reports/calibration_fit.md: after W the top-1/3/5
 # picks per slate are within ~1 pt of their shown P; 3 pts clears that by 2 se). Applies
@@ -155,7 +160,8 @@ class DataStore:
     def __init__(self, players: pd.DataFrame, teams: pd.DataFrame, asof=None,
                  calib_pairs: pd.DataFrame | None = None,
                  spread_rows: pd.DataFrame | None = None,
-                 w_rows: pd.DataFrame | None = None, w_real: dict | None = None):
+                 w_rows: pd.DataFrame | None = None, w_real: dict | None = None,
+                 form_rows: pd.DataFrame | None = None):
         """asof (a date): backfill mode. Only games before that date (00:00 UTC) are kept,
         so pools, rosters, lineups, kappas and the S / I / W fits use prior data only.
         calib_pairs / spread_rows / w_rows / w_real default to the files in data/ (pass
@@ -181,6 +187,7 @@ class DataStore:
         self.calibrator = load_calibrator(self.cutoff, calib_pairs)
         self.spread_k = load_spread(self.cutoff, spread_rows)
         self.w_lambda, self.w_source = load_w(self.cutoff, w_rows, w_real)
+        self.form_beta = load_form(self.cutoff, form_rows)
 
     @property
     def backfill(self) -> bool:
@@ -268,6 +275,36 @@ def load_w(cutoff, rows: pd.DataFrame | None = None, real: dict | None = None
     if lam.get("_n", 0) == 0 and lam["_pool"] == 1.0:
         return None, "none"
     return lam, "proxy lines"
+
+
+def load_form(cutoff, rows: pd.DataFrame | None = None) -> dict | None:
+    """H: {market: beta, "_pool": beta} from rows before cutoff; None = no file / no fit."""
+    rows = _read(rows, FORM_PATH)
+    if rows.empty:
+        return None
+    b = fit_form_asof(rows, pd.Timestamp(cutoff))
+    return b if any(v > 0 for v in b.values()) else None
+
+
+def form_factors(store, sim: SeriesSim, players: list[str], market: str) -> dict:
+    """H: {(player, market): c} from each player's last FORM_N_LAST series of the market
+    (>= FORM_MIN_PREV) vs the raw model mean of this sim."""
+    beta_t = getattr(store, "form_beta", None)
+    if not beta_t:
+        return {}
+    beta = beta_t.get(market, beta_t["_pool"])
+    out = {}
+    for pl in players:
+        avg, n = recent_avg(store.players, pl, market, FORM_N_LAST)
+        if n < FORM_MIN_PREV:
+            continue
+        s, j = sim.player_index(pl)
+        lo, hi = parse_market(market, sim.played.shape[1])
+        mean = float(sim.player_kills[:, lo - 1:hi, s, j].sum(axis=1).mean())
+        c = form_scale(mean, avg - mean, beta)
+        if c != 1.0:
+            out[(pl, market)] = c
+    return out
 
 
 def _build_rosters(players: pd.DataFrame) -> dict[str, list[dict]]:
@@ -378,8 +415,11 @@ def run_matchup(store: DataStore, m: MatchupInput, legs: int, n_sims: int = C.N_
     league = m.league or store.infer_league(m.team_a, m.team_b)
     sim, params = (sim_fn or simulate_matchup)(store, m, lines, odds, league, n_sims, seed)
     res = MatchupResult(m, league, odds, sim, params, lines)
-    # S is part of the locked model: every range_kills of this sim is inflated
+    # S is part of the locked model: every range_kills of this sim is inflated; H (recent
+    # form) scales each line player's total first
     sim.spread_k = getattr(store, "spread_k", None)
+    sim.form = form_factors(store, sim, list(dict.fromkeys(lm.player for lm in lines)),
+                            m.market)
     res.sim = sim
     cal = getattr(store, "calibrator", None)
     res.rows = [prop_row(res, lm, legs, cal, getattr(store, "w_lambda", None))
@@ -463,6 +503,7 @@ def prop_row(res: MatchupResult, lm: LineMatch, legs: int,
         raw_edge=raw_p - be, n_games=int(n_games), share=float(share), p_map=p_map,
         kind=kind, **floors(kills),
         **script_split(sim, lm.player, kills, float(lm.line), side),
+        form_c=float((sim.form or {}).get((lm.player, m.market), 1.0)),
     )
     # goblin / demon payouts are not the standard multiplier: never a PLAY on this edge
     row["play"] = bool(is_cal and row["edge"] >= MIN_EDGE and kind == "standard")
@@ -505,7 +546,9 @@ def explain(res: MatchupResult, lm: LineMatch, row: dict) -> str:
             f"losses ({res.league} env {info.get('target_env', float('nan')):.1f}); "
             f"{lm.player} ({lm.role}) takes {share} of team kills ({n} games); {adj}; "
             f"{lm.team} wins {p_map:.0%} of maps ({p_ser:.0%} series). "
-            f"Model mean {row['mean']:.1f} over {res.inp.market} vs line {row['line']:g}."
+            f"Model mean {row['mean']:.1f} over {res.inp.market} vs line {row['line']:g}"
+            + (f" (recent form x{row['form_c']:.2f}: last {FORM_N_LAST} series average "
+               "pulls the mean)" if row.get("form_c", 1.0) != 1.0 else "") + "."
             + raw)
 
 

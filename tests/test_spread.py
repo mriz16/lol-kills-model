@@ -201,7 +201,8 @@ def _store(processed, asof=None, pairs=None):
     players, teams = processed
     return DataStore(players, teams, asof=asof,
                      calib_pairs=pairs if pairs is not None else _pairs(10, date="2020-01-01"),
-                     spread_rows=pd.DataFrame(), w_rows=pd.DataFrame(), w_real={})
+                     spread_rows=pd.DataFrame(), w_rows=pd.DataFrame(), w_real={},
+                     form_rows=pd.DataFrame())
 
 
 def test_datastore_backfill_uses_prior_data_only(processed):

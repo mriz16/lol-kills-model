@@ -64,6 +64,47 @@ def market_totals(players: pd.DataFrame, player: str, market: str,
     return out.sort_values("date", ascending=False).reset_index(names="series_id")
 
 
+def all_market_totals(players: pd.DataFrame, market: str) -> pd.DataFrame:
+    """Every player's series totals of a market: series_id, player, date, kills (same
+    rules as market_totals, no opponents / results)."""
+    lo, hi, min_bo = MARKETS[market]
+    p = players
+    if "series_complete" in p:
+        p = p[p["series_complete"].astype(bool)]
+    p = p[(p["best_of"] >= min_bo) & (p["map_no"] >= lo) & (p["map_no"] <= hi)]
+    g = p.groupby([p["series_id"].astype(str).rename("series_id"),
+                   p["playername"].astype(str).rename("player")])
+    out = pd.DataFrame({"date": g["date"].min(), "kills": g["kills"].sum(), "maps": g.size()})
+    out = out[out["maps"] == hi - lo + 1].drop(columns="maps").reset_index()
+    return out.sort_values(["player", "date"]).reset_index(drop=True)
+
+
+def prior_form(players: pd.DataFrame, market: str, n_last: int = 20) -> pd.DataFrame:
+    """Per (series_id, player) of the market: n_prev (previous series, capped at n_last)
+    and avg_prev (their mean), using only series that started strictly earlier."""
+    t = all_market_totals(players, market)
+    out = []
+    for pl, g in t.groupby("player", sort=False):
+        d, k = g["date"].to_numpy(), g["kills"].to_numpy(float)
+        cs = np.concatenate([[0.0], np.cumsum(k)])
+        j = np.searchsorted(d, d, side="left")           # series strictly before
+        lo = np.maximum(j - n_last, 0)
+        n = j - lo
+        with np.errstate(invalid="ignore", divide="ignore"):
+            avg = np.where(n > 0, (cs[j] - cs[lo]) / np.maximum(n, 1), np.nan)
+        out.append(pd.DataFrame({"series_id": g["series_id"].to_numpy(), "player": pl,
+                                 "n_prev": n, "avg_prev": avg}))
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(
+        columns=["series_id", "player", "n_prev", "avg_prev"])
+
+
+def recent_avg(players: pd.DataFrame, player: str, market: str,
+               n_last: int = 20) -> tuple[float, int]:
+    """(mean of the player's latest n_last series of the market, how many)."""
+    t = market_totals(players, player, market).head(n_last)
+    return (float(t["kills"].mean()) if len(t) else np.nan), int(len(t))
+
+
 def _opponents(players: pd.DataFrame, sids, teams) -> list[str]:
     s = players[players["series_id"].astype(str).isin(set(sids))]
     names: dict = {}
