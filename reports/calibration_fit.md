@@ -1,6 +1,6 @@
 # Calibration fit (S, I, W)
 
-Fitted 2026-11-16T21:01:08+00:00 on 37,250 backtest player-series through 2026-10-28 (walk-forward, weekly refits, fits use series >= 1 day before). Base = live locked config L+O; S and I-beta on top; W on the S+I probabilities at proxy lines (rolling median of the player's last 10 market totals, floored, + 0.5).
+Fitted 2026-11-23T22:40:14+00:00 on 37,250 backtest player-series through 2026-10-28 (walk-forward, weekly refits, fits use series >= 1 day before). Base = live locked config L+O; S and I-beta on top; W on the S+I probabilities at proxy lines (rolling median of the player's last 10 market totals, floored, + 0.5).
 
 ## Drift check
 
